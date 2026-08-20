@@ -224,10 +224,16 @@ impl App {
         }
     }
 
-    pub(crate) fn open_settings(&mut self) {
+    /// `from_strip`: opened by right-clicking the strip, so the strip's own
+    /// monitor is the one the user is looking at. From the tray menu we only
+    /// have the pointer to go by.
+    pub(crate) fn open_settings(&mut self, from_strip: bool) {
         self.show_settings = true;
         self.settings_center = true;
-        self.settings_area = crate::settings_ui::cursor_work_area();
+        self.settings_area = from_strip
+            .then(|| self.hwnd.and_then(crate::settings_ui::window_work_area))
+            .flatten()
+            .or_else(crate::settings_ui::cursor_work_area);
     }
 
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
@@ -241,7 +247,7 @@ impl App {
                 self.shared.refresh.store(true, Ordering::Relaxed);
                 ctx.request_repaint();
             } else if id == tray.id_settings {
-                self.open_settings();
+                self.open_settings(false);
             } else if id == tray.id_autostart {
                 let now_checked = tray.autostart_item.is_checked();
                 match shortcuts::set_autostart(now_checked) {
@@ -860,7 +866,7 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
                 if resp.clicked_by(PointerButton::Secondary) {
-                    self.open_settings();
+                    self.open_settings(true);
                 }
                 self.draw_strip(ui, anim_t, animate_on);
             });

@@ -492,6 +492,32 @@ pub(crate) fn cursor_work_area() -> Option<(i32, i32, i32, i32)> {
     }
 }
 
+/// Work area of the monitor a window sits on.
+#[cfg(windows)]
+pub(crate) fn window_work_area(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    unsafe {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let monitor = MonitorFromWindow(HWND(hwnd as *mut _), MONITOR_DEFAULTTONEAREST);
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+        let w = info.rcWork;
+        Some((w.left, w.top, w.right, w.bottom))
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn window_work_area(_hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
 /// Centre the settings window in `area`. Done through Win32 on the real window:
 /// egui's viewport position is logical and relative to one screen, which lands
 /// in the wrong place on a multi-monitor desktop.

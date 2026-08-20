@@ -1,0 +1,5 @@
+/target
+/dist
+/tools/dev
+quotty-debug.log
+*.log

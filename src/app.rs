@@ -174,6 +174,11 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: Settings) -> Self {
         let _ = shortcuts::ensure_desktop_shortcut();
         crate::settings_ui::apply_style(&cc.egui_ctx);
+        providers::set_diagnostics(settings.diagnostics);
+        providers::diag(&format!(
+            "--- quotty {} started, diagnostics on ---",
+            update::current()
+        ));
 
         let shared = Arc::new(Shared {
             states: Mutex::new(

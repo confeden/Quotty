@@ -7,7 +7,7 @@
 //! authenticates callers with a per-launch CSRF token, so we need both the port
 //! and that token, and we must skip certificate verification for it.
 
-use super::{dbg_log, Family, Limit, Snapshot};
+use super::{dbg_log, diag, Family, Limit, Snapshot};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -374,14 +374,22 @@ pub fn fetch() -> Result<Snapshot, String> {
         return Err("Antigravity не запущен".into());
     }
 
+    diag(&format!("antigravity: {} endpoint(s) to try", eps.len()));
     let mut last_err = String::new();
     for ep in &eps {
+        let started = std::time::Instant::now();
         match call(ep) {
             Ok(status) => {
                 remember(ep);
+                diag(&format!(
+                    "antigravity: 200 from port {} in {} ms",
+                    ep.port,
+                    started.elapsed().as_millis()
+                ));
                 return Ok(build_snapshot(status));
             }
             Err(e) => {
+                diag(&format!("antigravity: port {} -> {e}", ep.port));
                 last_err = e;
             }
         }

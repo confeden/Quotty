@@ -6,7 +6,7 @@
 //! a refresh is picked up. We never write to it — rotating the refresh token
 //! from here would sign the user out of Codex.
 
-use super::{dbg_log, window_title, Family, Limit, Snapshot};
+use super::{dbg_log, diag, window_title, Family, Limit, Snapshot};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -113,13 +113,26 @@ pub fn fetch() -> Result<Snapshot, String> {
         req = req.set("chatgpt-account-id", acc);
     }
 
+    let started = std::time::Instant::now();
     let usage: UsageResponse = match req.call() {
-        Ok(resp) => resp.into_json().map_err(|e| format!("parse usage: {e}"))?,
+        Ok(resp) => {
+            diag(&format!(
+                "codex: 200 in {} ms",
+                started.elapsed().as_millis()
+            ));
+            resp.into_json().map_err(|e| format!("parse usage: {e}"))?
+        }
         Err(ureq::Error::Status(401, _)) => {
             return Err("токен Codex устарел — откройте Codex".into())
         }
-        Err(ureq::Error::Status(code, _)) => return Err(format!("status {code}")),
-        Err(e) => return Err(format!("network: {e}")),
+        Err(ureq::Error::Status(code, _)) => {
+            diag(&format!("codex: status {code}"));
+            return Err(format!("status {code}"));
+        }
+        Err(e) => {
+            diag(&format!("codex: network error ({e})"));
+            return Err(format!("network: {e}"));
+        }
     };
 
     Ok(build_snapshot(usage))

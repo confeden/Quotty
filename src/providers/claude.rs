@@ -5,7 +5,7 @@
 //! Covers Claude Code / the Claude CLI too: on Windows they run inside the
 //! Desktop app's account, so the same token and the same quota apply.
 
-use super::{dbg_log, Family, Limit, Snapshot};
+use super::{dbg_log, diag, diagnostics_on, Family, Limit, Snapshot};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -224,6 +224,8 @@ pub struct OauthToken {
     pub access: String,
     pub subscription: Option<String>,
     pub tier: Option<String>,
+    /// Which cache it came from — "V2" or "V1", for the diagnostics log.
+    pub source: &'static str,
 }
 
 /// Decrypt `config.json`'s `oauth:tokenCache` into all usable tokens, ordered by
@@ -296,6 +298,7 @@ pub fn load_tokens() -> Result<Vec<OauthToken>, String> {
                     access: entry.token,
                     subscription: entry.subscription_type,
                     tier: entry.rate_limit_tier,
+                    source: if fresh { "V2" } else { "V1" },
                 },
             ));
         }
@@ -349,13 +352,18 @@ enum Failure {
     /// Nothing else will work this poll (transport error, bad response).
     Stop,
     /// The endpoint is throttling this account or IP. Every other token would
-    /// get the same answer, and asking again soon only deepens it.
-    RateLimited,
+    /// get the same answer, and asking again soon only deepens it. Carries the
+    /// server's own `Retry-After`, in seconds, when it sent one.
+    RateLimited(Option<u64>),
 }
 
 /// The endpoint answers 429 per account/IP, not per token, so a burst of
-/// retries is what keeps it there. Sit out a few minutes sending nothing.
+/// retries is what keeps it there. Sit out sending nothing — for as long as the
+/// server asked, if it said, and five minutes if it did not.
 const RATE_LIMIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+/// Anthropic has been seen asking for 2708 s; anything beyond an hour is more
+/// likely a broken header than a real ban.
+const RATE_LIMIT_MAX: u64 = 3600;
 static COOLDOWN_UNTIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// Time left of the cooldown, if one is running.
@@ -366,6 +374,16 @@ fn cooldown_left() -> Option<std::time::Duration> {
 
 fn set_cooldown(on: bool) {
     *COOLDOWN_UNTIL.lock().unwrap() = on.then(|| std::time::Instant::now() + RATE_LIMIT_COOLDOWN);
+}
+
+/// Start a cooldown of the length the server asked for.
+fn set_cooldown_secs(retry_after: Option<u64>) -> std::time::Duration {
+    let secs = retry_after
+        .unwrap_or(RATE_LIMIT_COOLDOWN.as_secs())
+        .clamp(30, RATE_LIMIT_MAX);
+    let wait = std::time::Duration::from_secs(secs);
+    *COOLDOWN_UNTIL.lock().unwrap() = Some(std::time::Instant::now() + wait);
+    wait
 }
 
 /// One usage request.
@@ -381,7 +399,18 @@ fn request_usage(access: &str) -> Result<UsageResponse, (Failure, String)> {
         Ok(resp) => resp
             .into_json()
             .map_err(|e| (Failure::Stop, format!("parse usage: {e}"))),
-        Err(ureq::Error::Status(429, _)) => Err((Failure::RateLimited, "status 429".into())),
+        Err(ureq::Error::Status(429, resp)) => {
+            let retry_after = resp
+                .header("retry-after")
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            Err((
+                Failure::RateLimited(retry_after),
+                match retry_after {
+                    Some(s) => format!("status 429, retry-after {s}s"),
+                    None => "status 429".to_string(),
+                },
+            ))
+        }
         Err(ureq::Error::Status(code, _)) => {
             // 401/403 are per-token: config.json holds entries that are
             // inference-only or stale, and the next one may still work.
@@ -395,6 +424,20 @@ fn request_usage(access: &str) -> Result<UsageResponse, (Failure, String)> {
         // Transport error (offline, DNS, TLS): same for every token → stop.
         Err(e) => Err((Failure::Stop, format!("network: {e}"))),
     }
+}
+
+/// Which address the usage endpoint currently resolves to. Worth a line in the
+/// log: a machine reaching Anthropic through an unblocking relay shares that
+/// relay's rate limit with everyone else behind it, which looks exactly like a
+/// broken token from the inside.
+fn endpoint_ip() -> String {
+    use std::net::ToSocketAddrs;
+    ("api.anthropic.com", 443)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "unresolved".into())
 }
 
 /// Fetch a fresh snapshot: reads tokens from disk and tries each against the
@@ -415,28 +458,54 @@ pub fn fetch() -> Result<Snapshot, String> {
         }
     }
 
+    if diagnostics_on() {
+        let kinds: Vec<String> = tokens
+            .iter()
+            .map(|t| format!("{}/{}", t.source, t.subscription.as_deref().unwrap_or("-")))
+            .collect();
+        diag(&format!(
+            "claude: {} token(s) [{}], api.anthropic.com -> {}",
+            tokens.len(),
+            kinds.join(", "),
+            endpoint_ip()
+        ));
+    }
+
     let mut last_err = "no token tried".to_string();
     for tok in &tokens {
+        let started = std::time::Instant::now();
         match request_usage(&tok.access) {
             Ok(usage) => {
                 *LAST_GOOD.lock().unwrap() = Some(tok.access.clone());
                 set_cooldown(false);
+                diag(&format!(
+                    "claude: 200 in {} ms (token {}/{})",
+                    started.elapsed().as_millis(),
+                    tok.source,
+                    tok.subscription.as_deref().unwrap_or("-")
+                ));
                 return Ok(build_snapshot(usage, tok));
             }
             Err((what, msg)) => {
-                let head: String = tok.access.chars().take(20).collect();
-                dbg_log(&format!("token {head}… -> {msg}"));
+                dbg_log(&format!(
+                    "claude: token {}/{} -> {msg} in {} ms",
+                    tok.source,
+                    tok.subscription.as_deref().unwrap_or("-"),
+                    started.elapsed().as_millis()
+                ));
                 last_err = msg;
                 match what {
                     Failure::NextToken => continue,
                     Failure::Stop => break,
-                    Failure::RateLimited => {
-                        set_cooldown(true);
+                    Failure::RateLimited(retry_after) => {
+                        let wait = set_cooldown_secs(retry_after);
                         *LAST_GOOD.lock().unwrap() = None;
-                        return Err(format!(
-                            "лимит запросов, пауза {} мин",
-                            RATE_LIMIT_COOLDOWN.as_secs() / 60
+                        let mins = (wait.as_secs() / 60).max(1);
+                        diag(&format!(
+                            "claude: rate limited, sleeping {}s",
+                            wait.as_secs()
                         ));
+                        return Err(format!("лимит запросов, пауза {mins} мин"));
                     }
                 }
             }

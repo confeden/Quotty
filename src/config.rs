@@ -43,6 +43,8 @@ pub struct Settings {
     pub active_mode: ActiveMode,
     /// Pinned family, and the one restored at startup.
     pub family: Family,
+    /// Verbose, anonymised logging next to the exe. Off unless asked for.
+    pub diagnostics: bool,
 }
 
 impl Default for Settings {
@@ -58,6 +60,7 @@ impl Default for Settings {
             antigravity_enabled: true,
             active_mode: ActiveMode::Auto,
             family: Family::Claude,
+            diagnostics: false,
         }
     }
 }

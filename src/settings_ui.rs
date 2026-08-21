@@ -413,6 +413,29 @@ impl App {
             if ui.button("Создать ярлык на рабочем столе").clicked() {
                 let _ = shortcuts::force_desktop_shortcut();
             }
+
+            ui.add_space(6.0);
+            let mut diag = self.settings.diagnostics;
+            if ui
+                .checkbox(&mut diag, "Подробная диагностика (файл рядом с exe)")
+                .changed()
+            {
+                self.settings.diagnostics = diag;
+                crate::providers::set_diagnostics(diag);
+                self.settings.save();
+            }
+            ui.label(
+                RichText::new(
+                    "Пишет в quotty-debug.log коды ответов, адрес API и время запросов.\n\
+                     Обезличено: без токенов, почты и имени пользователя.\n\
+                     Никуда не отправляется — файл можно приложить к сообщению.",
+                )
+                .size(10.5)
+                .color(HINT),
+            );
+            if ui.button("Показать файл журнала").clicked() {
+                reveal_log();
+            }
         });
     }
 }
@@ -495,6 +518,29 @@ fn close_button(ui: &mut egui::Ui) -> bool {
     ui.painter()
         .line_segment([c + Vec2::new(r, -r), c + Vec2::new(-r, r)], s);
     resp.clicked()
+}
+
+/// Open Explorer on the log file (or its folder, when nothing has been logged).
+fn reveal_log() {
+    let Some(path) = crate::providers::log_path() else {
+        return;
+    };
+    let arg = if path.exists() {
+        format!("/select,{}", path.display())
+    } else {
+        path.parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("explorer.exe")
+            .raw_arg(&arg)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
 }
 
 /// Keep an error readable on one line.

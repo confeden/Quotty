@@ -6,6 +6,7 @@
 //! CLI session counts as its own family.
 
 use crate::providers::Family;
+use crate::winproc;
 
 /// Exe name → family, for windows that *are* the tool.
 fn direct(exe: &str) -> Option<Family> {
@@ -118,32 +119,9 @@ fn foreground_pid() -> Option<u32> {
     }
 }
 
-#[cfg(windows)]
 fn process_name(pid: u32) -> Option<String> {
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = [0u16; 260];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        )
-        .is_ok();
-        let _ = CloseHandle(handle);
-        if !ok {
-            return None;
-        }
-        let full = String::from_utf16_lossy(&buf[..len as usize]);
-        Some(full.rsplit(['\\', '/']).next()?.to_string())
-    }
+    let full = winproc::image_path(pid)?;
+    Some(full.rsplit(['\\', '/']).next()?.to_string())
 }
 
 /// Walk everything started under `root` and return the family of the most
@@ -151,46 +129,13 @@ fn process_name(pid: u32) -> Option<String> {
 /// launched over one sitting in another tab). With `hop_parent`, the walk starts
 /// at the root's parent instead: a console host's CLI is its sibling, not its
 /// child.
-#[cfg(windows)]
 fn family_in_tree(root: u32, hop_parent: bool) -> Option<Family> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
-
-    let mut procs: Vec<(u32, u32, String)> = Vec::new();
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        if Process32FirstW(snap, &mut entry).is_ok() {
-            loop {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|c| *c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                procs.push((
-                    entry.th32ProcessID,
-                    entry.th32ParentProcessID,
-                    String::from_utf16_lossy(&entry.szExeFile[..end]).to_lowercase(),
-                ));
-                if Process32NextW(snap, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snap);
-    }
-
+    let procs = winproc::snapshot();
     let root = if hop_parent {
         procs
             .iter()
-            .find(|(pid, _, _)| *pid == root)
-            .map(|(_, ppid, _)| *ppid)
+            .find(|p| p.pid == root)
+            .map(|p| p.parent)
             .filter(|p| *p != 0)
             .unwrap_or(root)
     } else {
@@ -202,15 +147,15 @@ fn family_in_tree(root: u32, hop_parent: bool) -> Option<Family> {
     let mut seen = vec![root];
     let mut best: Option<(u32, Family)> = None;
     while let Some(parent) = frontier.pop() {
-        for (pid, ppid, name) in &procs {
-            if *ppid != parent || seen.contains(pid) {
+        for p in &procs {
+            if p.parent != parent || seen.contains(&p.pid) {
                 continue;
             }
-            seen.push(*pid);
-            frontier.push(*pid);
-            if let Some(f) = direct(name) {
-                if best.map_or(true, |(bp, _)| *pid > bp) {
-                    best = Some((*pid, f));
+            seen.push(p.pid);
+            frontier.push(p.pid);
+            if let Some(f) = direct(&p.name) {
+                if best.map_or(true, |(bp, _)| p.pid > bp) {
+                    best = Some((p.pid, f));
                 }
             }
         }
@@ -224,13 +169,5 @@ fn family_in_tree(root: u32, hop_parent: bool) -> Option<Family> {
 
 #[cfg(not(windows))]
 fn foreground_pid() -> Option<u32> {
-    None
-}
-#[cfg(not(windows))]
-fn process_name(_pid: u32) -> Option<String> {
-    None
-}
-#[cfg(not(windows))]
-fn family_in_tree(_root: u32, _hop_parent: bool) -> Option<Family> {
     None
 }

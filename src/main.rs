@@ -10,6 +10,7 @@ mod settings_ui;
 mod shortcuts;
 mod tray;
 mod update;
+mod winproc;
 
 use eframe::egui;
 

@@ -3,6 +3,7 @@
 use crate::providers::Family;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// What the strip's header line shows.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,16 +62,70 @@ impl Default for Settings {
     }
 }
 
+/// Where `settings.json` may live. `dirs::config_dir()` alone is not enough:
+/// depending on how the exe was started (shortcut, Startup folder, shell) it has
+/// been seen to resolve to something other than the real Roaming directory, and
+/// the app would then silently start from defaults every login.
+fn candidate_paths() -> Vec<PathBuf> {
+    let mut dirs_list: Vec<PathBuf> = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        dirs_list.push(PathBuf::from(appdata));
+    }
+    if let Some(cfg) = dirs::config_dir() {
+        dirs_list.push(cfg);
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        dirs_list.push(PathBuf::from(profile).join("AppData").join("Roaming"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        dirs_list.push(home.join("AppData").join("Roaming"));
+    }
+    dirs_list.dedup();
+    dirs_list
+        .into_iter()
+        .map(|d| d.join("Quotty").join("settings.json"))
+        .collect()
+}
+
 impl Settings {
+    /// Resolved once: an existing file wins wherever it is, so load and save
+    /// can never end up on different paths.
     fn path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("Quotty").join("settings.json"))
+        static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let candidates = candidate_paths();
+            candidates
+                .iter()
+                .find(|p| std::fs::metadata(p).is_ok())
+                .cloned()
+                .or_else(|| candidates.into_iter().next())
+        })
+        .clone()
     }
 
     pub fn load() -> Self {
-        let mut s: Settings = Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+        let path = Self::path();
+        let raw = path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+        // Falling back to defaults silently would look like "the app forgot
+        // everything", so say why in the debug log.
+        let mut s: Settings = match &raw {
+            None => {
+                crate::providers::dbg_log(&format!(
+                    "settings: nothing readable among {:?}",
+                    candidate_paths()
+                ));
+                Settings::default()
+            }
+            // Windows editors and PowerShell's `Set-Content -Encoding UTF8`
+            // put a BOM in front, which JSON parsers reject outright.
+            Some(text) => match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    crate::providers::dbg_log(&format!("settings: {path:?} unparseable: {e}"));
+                    Settings::default()
+                }
+            },
+        };
         s.opacity = s.opacity.clamp(0.15, 1.0);
         if s.poll_secs < 15 {
             s.poll_secs = 15;

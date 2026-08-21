@@ -75,6 +75,9 @@ pub struct App {
     timer_period: u32,
     /// Tray hover text we last set, so we only touch the icon on a change.
     tooltip: String,
+    /// A drag we started ourselves is in progress; only then is the window's
+    /// new position worth persisting.
+    dragging: bool,
 }
 
 /// Pull the Win32 HWND out of eframe's frame (None on other platforms).
@@ -221,6 +224,7 @@ impl App {
             hwnd: None,
             timer_period: 0,
             tooltip: String::new(),
+            dragging: false,
         }
     }
 
@@ -402,7 +406,11 @@ impl App {
     /// opening anything.
     fn sync_tooltip(&mut self) {
         let want = match &self.shared.update.lock().unwrap().available {
-            Some(u) => format!("Quotty {} — доступно обновление {}", update::current(), u.version),
+            Some(u) => format!(
+                "Quotty {} — доступно обновление {}",
+                update::current(),
+                u.version
+            ),
             None => format!("Quotty {}", update::current()),
         };
         if want != self.tooltip {
@@ -864,6 +872,7 @@ impl eframe::App for App {
                 let resp = ui.interact(full, ui.id().with("strip-drag"), Sense::click_and_drag());
                 if resp.drag_started_by(PointerButton::Primary) {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                    self.dragging = true;
                 }
                 if resp.clicked_by(PointerButton::Secondary) {
                     self.open_settings(true);
@@ -871,8 +880,11 @@ impl eframe::App for App {
                 self.draw_strip(ui, anim_t, animate_on);
             });
 
-        // Persist window position when the user finishes moving it.
-        if ctx.input(|i| i.pointer.any_released()) {
+        // Persist the window position when the user finishes moving it — and
+        // only then. Saving on any release once let the placement the shell
+        // imposes on a shortcut launch overwrite the user's own position.
+        if self.dragging && ctx.input(|i| i.pointer.any_released()) {
+            self.dragging = false;
             if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
                 let p = (r.min.x, r.min.y);
                 if self.settings.pos != Some(p) {

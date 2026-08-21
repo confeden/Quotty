@@ -31,34 +31,102 @@ struct Endpoint {
     seen: SystemTime,
 }
 
-/// Every place a running language server announces itself.
+/// Every place a running language server announces itself, best first.
 fn candidates() -> Vec<Endpoint> {
     let mut out: Vec<Endpoint> = Vec::new();
 
-    // 1. Daemon descriptors: `~/.gemini/<surface>/daemon/ls_*.json`, written by
+    // 1. Whatever answered last time — a running server keeps its port and
+    //    token until it restarts, so the steady state is a single request.
+    if let Some(ep) = last_good() {
+        out.push(ep);
+    }
+
+    // 2. The running processes themselves: port from the TCP table, token from
+    //    the command line. The only source that works for Antigravity IDE,
+    //    which writes neither a daemon descriptor nor an Electron log.
+    from_processes(&mut out);
+
+    // 3. Daemon descriptors: `~/.gemini/<surface>/daemon/ls_*.json`, written by
     //    the language server with its own port and token.
+    let mut files: Vec<Endpoint> = Vec::new();
     if let Some(home) = dirs::home_dir() {
         let gemini = home.join(".gemini");
         if let Ok(subdirs) = std::fs::read_dir(&gemini) {
             for sub in subdirs.flatten() {
-                scan_daemon_dir(&sub.path().join("daemon"), &mut out);
+                scan_daemon_dir(&sub.path().join("daemon"), &mut files);
             }
         }
     }
 
-    // 2. The Electron app's own log, which records the language server command
+    // 4. The Electron app's own log, which records the language server command
     //    line (with `--csrf_token`) and the resulting local URL.
     for base in appdata_bases() {
         for app in ["Antigravity", "Antigravity IDE"] {
             if let Some(e) = from_main_log(&base.join(app).join("logs").join("main.log")) {
-                out.push(e);
+                files.push(e);
             }
         }
     }
+    files.sort_by(|a, b| b.seen.cmp(&a.seen));
+    out.append(&mut files);
 
-    out.sort_by(|a, b| b.seen.cmp(&a.seen));
     out.dedup_by(|a, b| a.port == b.port && a.csrf == b.csrf);
     out
+}
+
+/// Language servers that are alive right now. Works across elevation: the IDE
+/// may run "as administrator" while Quotty doesn't, and both the TCP table and
+/// `PROCESS_QUERY_LIMITED_INFORMATION` still answer.
+fn from_processes(out: &mut Vec<Endpoint>) {
+    use crate::winproc;
+
+    // The 2.0 app ships `language_server.exe`, the IDE
+    // `language_server_windows_x64.exe`.
+    let mut servers: Vec<(u32, String)> = winproc::snapshot()
+        .into_iter()
+        .filter(|p| p.name.starts_with("language_server"))
+        .filter_map(|p| Some((p.pid, csrf_of(p.pid)?)))
+        .collect();
+    if servers.is_empty() {
+        return;
+    }
+    servers.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+
+    let listening = winproc::listening_ports();
+    for (pid, csrf) in servers {
+        let mut ports: Vec<u16> = listening
+            .iter()
+            .filter(|(owner, _)| *owner == pid)
+            .map(|(_, port)| *port)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        // The server opens HTTPS and HTTP on adjacent ports, HTTPS the lower of
+        // the two; its other port (LSP) speaks no TLS and would eat a timeout.
+        let chosen: Vec<u16> = match ports.iter().copied().find(|p| ports.contains(&(p + 1))) {
+            Some(https) => vec![https],
+            None => ports.iter().copied().take(2).collect(),
+        };
+        for port in chosen {
+            out.push(Endpoint {
+                port,
+                csrf: csrf.clone(),
+                seen: SystemTime::now(),
+            });
+        }
+    }
+}
+
+/// `--csrf_token <uuid>` out of a language server's command line.
+fn csrf_of(pid: u32) -> Option<String> {
+    let cmd = crate::winproc::command_line(pid)?;
+    let at = cmd.rfind("--csrf_token")? + "--csrf_token".len();
+    let token: String = cmd[at..]
+        .trim_start_matches([' ', '=', '"'])
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    (!token.is_empty()).then_some(token)
 }
 
 fn appdata_bases() -> Vec<PathBuf> {
@@ -196,9 +264,30 @@ fn agent() -> &'static ureq::Agent {
             .with_no_client_auth();
         ureq::AgentBuilder::new()
             .tls_config(Arc::new(cfg))
-            .timeout(std::time::Duration::from_secs(8))
+            // A wrong guess should cost little: a dead port refuses instantly,
+            // and a live port that speaks no TLS is capped by the read timeout.
+            .timeout_connect(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(5))
             .build()
     })
+}
+
+/// The endpoint that answered last. A server keeps its port and token for its
+/// whole life, so remembering the winner keeps the steady state at one request.
+static LAST_GOOD: OnceLock<std::sync::Mutex<Option<Endpoint>>> = OnceLock::new();
+
+fn last_good_slot() -> &'static std::sync::Mutex<Option<Endpoint>> {
+    LAST_GOOD.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn last_good() -> Option<Endpoint> {
+    last_good_slot().lock().ok()?.clone()
+}
+
+fn remember(ep: &Endpoint) {
+    if let Ok(mut slot) = last_good_slot().lock() {
+        *slot = Some(ep.clone());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +369,10 @@ pub fn fetch() -> Result<Snapshot, String> {
     let mut last_err = String::new();
     for ep in &eps {
         match call(ep) {
-            Ok(status) => return Ok(build_snapshot(status)),
+            Ok(status) => {
+                remember(ep);
+                return Ok(build_snapshot(status));
+            }
             Err(e) => {
                 last_err = e;
             }

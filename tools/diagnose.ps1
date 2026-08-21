@@ -8,7 +8,15 @@
     Nothing is uploaded anywhere. Tokens are never printed: only their length
     and a masked prefix, so the report is safe to send to the author.
 #>
-param([string]$Out = "$PSScriptRoot\quotty-report.txt")
+param([string]$Out)
+
+# Default next to the script, but fall back to the temp folder: the script may
+# sit in a read-only place, or be pasted into a console where $PSScriptRoot is
+# empty.
+if (-not $Out) {
+    $dir = if ($PSScriptRoot) { $PSScriptRoot } else { $env:TEMP }
+    $Out = Join-Path $dir 'quotty-report.txt'
+}
 
 $r = [System.Collections.Generic.List[string]]::new()
 function Add($t) { $r.Add([string]$t) }
@@ -157,7 +165,12 @@ Add "config.json MISSING : Quotty is looking in the wrong place; send the candid
 Add "debug log absent    : Quotty has not failed since it started — restart it, reproduce,"
 Add "                      then run this script again"
 
-$r | Set-Content -Path $Out -Encoding UTF8
+try {
+    $r | Set-Content -Path $Out -Encoding UTF8 -ErrorAction Stop
+} catch {
+    $Out = Join-Path $env:TEMP 'quotty-report.txt'
+    $r | Set-Content -Path $Out -Encoding UTF8
+}
 Write-Output ($r -join [Environment]::NewLine)
 Write-Output ""
 Write-Output ("Report saved to: " + $Out)

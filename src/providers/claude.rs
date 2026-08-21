@@ -214,6 +214,10 @@ struct TokenEntry {
     #[serde(default)]
     #[serde(rename = "rateLimitTier")]
     rate_limit_tier: Option<String>,
+    /// Milliseconds since the epoch.
+    #[serde(default)]
+    #[serde(rename = "expiresAt")]
+    expires_at: Option<i64>,
 }
 
 pub struct OauthToken {
@@ -226,6 +230,23 @@ pub struct OauthToken {
 /// preference (subscription + `user:profile` scope first). config.json can hold
 /// several OAuth entries (different app registrations) — some are stale/rate-
 /// limited/wrong-scope, so `fetch()` tries them in order until one works.
+/// Decrypt one `v10` Chromium blob into the map of scope → token entry.
+fn decrypt_cache(
+    cipher: &Aes256Gcm,
+    encoded: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let raw = B64
+        .decode(encoded.as_bytes())
+        .map_err(|e| format!("b64 cache: {e}"))?;
+    if raw.len() < 3 + 12 + 16 || &raw[..3] != b"v10" {
+        return Err("unexpected token cache format".into());
+    }
+    let plain = cipher
+        .decrypt(Nonce::from_slice(&raw[3..15]), &raw[15..])
+        .map_err(|_| "AES-GCM decrypt failed".to_string())?;
+    serde_json::from_slice(&plain).map_err(|e| format!("parse token json: {e}"))
+}
+
 pub fn load_tokens() -> Result<Vec<OauthToken>, String> {
     let files = find_claude_files()?;
     let key_bytes = master_key(&files.local_state)?;
@@ -233,45 +254,54 @@ pub fn load_tokens() -> Result<Vec<OauthToken>, String> {
 
     let cfg: serde_json::Value =
         serde_json::from_str(&files.config).map_err(|e| format!("parse config.json: {e}"))?;
-    let enc = cfg
-        .get("oauth:tokenCache")
-        .and_then(|v| v.as_str())
-        .ok_or("no oauth:tokenCache in config.json")?;
 
-    let raw = B64
-        .decode(enc.as_bytes())
-        .map_err(|e| format!("b64 cache: {e}"))?;
-    if raw.len() < 3 + 12 + 16 || &raw[..3] != b"v10" {
-        return Err("unexpected token cache format".into());
-    }
-    let nonce = Nonce::from_slice(&raw[3..15]);
-    let plain = cipher
-        .decrypt(nonce, &raw[15..])
-        .map_err(|_| "AES-GCM decrypt failed".to_string())?;
-    let json: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(&plain).map_err(|e| format!("parse token json: {e}"))?;
-
+    let now_ms = Utc::now().timestamp_millis();
     let mut scored: Vec<(u8, OauthToken)> = Vec::new();
-    for (scope_key, val) in json.iter() {
-        let entry: TokenEntry = match serde_json::from_value(val.clone()) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let has_profile = scope_key.contains("user:profile");
-        let has_sub = entry.subscription_type.is_some();
-        // The usage endpoint needs the profile scope; inference-only tokens 403.
-        if !has_profile {
+    let mut last_err = String::new();
+
+    // Newer Claude Desktop builds keep the live tokens in `oauth:tokenCacheV2`
+    // and leave the old cache behind. Both are read: V1 alone still works today,
+    // but its entries are the stale ones — including tokens that authenticate
+    // yet carry no plan, which is why the header could lose "Max 20×".
+    for (cache_key, fresh) in [("oauth:tokenCacheV2", true), ("oauth:tokenCache", false)] {
+        let Some(enc) = cfg.get(cache_key).and_then(|v| v.as_str()) else {
             continue;
+        };
+        let json = match decrypt_cache(&cipher, enc) {
+            Ok(j) => j,
+            Err(e) => {
+                last_err = format!("{cache_key}: {e}");
+                continue;
+            }
+        };
+
+        for (scope_key, val) in json.iter() {
+            let entry: TokenEntry = match serde_json::from_value(val.clone()) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            // The usage endpoint needs the profile scope; inference-only tokens 403.
+            if !scope_key.contains("user:profile") {
+                continue;
+            }
+            // An expired entry would only cost a 401 round-trip.
+            if entry.expires_at.is_some_and(|ms| ms <= now_ms) {
+                continue;
+            }
+            let has_sub = entry.subscription_type.is_some();
+            let score = (fresh as u8) * 4 + (has_sub as u8) * 2 + 1;
+            scored.push((
+                score,
+                OauthToken {
+                    access: entry.token,
+                    subscription: entry.subscription_type,
+                    tier: entry.rate_limit_tier,
+                },
+            ));
         }
-        let score = (has_sub as u8) * 2 + has_profile as u8;
-        scored.push((
-            score,
-            OauthToken {
-                access: entry.token,
-                subscription: entry.subscription_type,
-                tier: entry.rate_limit_tier,
-            },
-        ));
+    }
+    if scored.is_empty() && !last_err.is_empty() {
+        return Err(last_err);
     }
     scored.sort_by(|a, b| b.0.cmp(&a.0)); // stable: keeps file order within a score
     let tokens: Vec<OauthToken> = scored.into_iter().map(|(_, t)| t).collect();
@@ -312,9 +342,34 @@ fn parse_ts(s: &Option<String>) -> Option<DateTime<Utc>> {
 /// don't repeatedly hit stale/rate-limited entries.
 static LAST_GOOD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// One usage request. `Err((retryable, msg))`: retryable = try the next token
-/// (auth/scope/rate-limit status); non-retryable = give up this poll.
-fn request_usage(access: &str) -> Result<UsageResponse, (bool, String)> {
+/// What a failed request means for the rest of the poll.
+enum Failure {
+    /// This token is not the one — try the next entry.
+    NextToken,
+    /// Nothing else will work this poll (transport error, bad response).
+    Stop,
+    /// The endpoint is throttling this account or IP. Every other token would
+    /// get the same answer, and asking again soon only deepens it.
+    RateLimited,
+}
+
+/// The endpoint answers 429 per account/IP, not per token, so a burst of
+/// retries is what keeps it there. Sit out a few minutes sending nothing.
+const RATE_LIMIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+static COOLDOWN_UNTIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Time left of the cooldown, if one is running.
+fn cooldown_left() -> Option<std::time::Duration> {
+    let until = (*COOLDOWN_UNTIL.lock().unwrap())?;
+    until.checked_duration_since(std::time::Instant::now())
+}
+
+fn set_cooldown(on: bool) {
+    *COOLDOWN_UNTIL.lock().unwrap() = on.then(|| std::time::Instant::now() + RATE_LIMIT_COOLDOWN);
+}
+
+/// One usage request.
+fn request_usage(access: &str) -> Result<UsageResponse, (Failure, String)> {
     match ureq::get("https://api.anthropic.com/api/oauth/usage")
         .set("Authorization", &format!("Bearer {access}"))
         .set("anthropic-beta", "oauth-2025-04-20")
@@ -325,19 +380,32 @@ fn request_usage(access: &str) -> Result<UsageResponse, (bool, String)> {
     {
         Ok(resp) => resp
             .into_json()
-            .map_err(|e| (false, format!("parse usage: {e}"))),
+            .map_err(|e| (Failure::Stop, format!("parse usage: {e}"))),
+        Err(ureq::Error::Status(429, _)) => Err((Failure::RateLimited, "status 429".into())),
         Err(ureq::Error::Status(code, _)) => {
-            let retryable = matches!(code, 401 | 403 | 429);
-            Err((retryable, format!("status {code}")))
+            // 401/403 are per-token: config.json holds entries that are
+            // inference-only or stale, and the next one may still work.
+            let what = if matches!(code, 401 | 403) {
+                Failure::NextToken
+            } else {
+                Failure::Stop
+            };
+            Err((what, format!("status {code}")))
         }
         // Transport error (offline, DNS, TLS): same for every token → stop.
-        Err(e) => Err((false, format!("network: {e}"))),
+        Err(e) => Err((Failure::Stop, format!("network: {e}"))),
     }
 }
 
 /// Fetch a fresh snapshot: reads tokens from disk and tries each against the
 /// usage endpoint until one succeeds.
 pub fn fetch() -> Result<Snapshot, String> {
+    if let Some(left) = cooldown_left() {
+        return Err(format!(
+            "лимит запросов, пауза {} мин",
+            (left.as_secs() / 60) + 1
+        ));
+    }
     let mut tokens = load_tokens()?;
 
     // Try the previously-working token first.
@@ -352,14 +420,24 @@ pub fn fetch() -> Result<Snapshot, String> {
         match request_usage(&tok.access) {
             Ok(usage) => {
                 *LAST_GOOD.lock().unwrap() = Some(tok.access.clone());
+                set_cooldown(false);
                 return Ok(build_snapshot(usage, tok));
             }
-            Err((retryable, msg)) => {
+            Err((what, msg)) => {
                 let head: String = tok.access.chars().take(20).collect();
-                dbg_log(&format!("token {head}… -> {msg} (retryable={retryable})"));
+                dbg_log(&format!("token {head}… -> {msg}"));
                 last_err = msg;
-                if !retryable {
-                    break;
+                match what {
+                    Failure::NextToken => continue,
+                    Failure::Stop => break,
+                    Failure::RateLimited => {
+                        set_cooldown(true);
+                        *LAST_GOOD.lock().unwrap() = None;
+                        return Err(format!(
+                            "лимит запросов, пауза {} мин",
+                            RATE_LIMIT_COOLDOWN.as_secs() / 60
+                        ));
+                    }
                 }
             }
         }
@@ -416,5 +494,23 @@ fn pretty_plan(sub: Option<&str>, tier: Option<&str>) -> String {
         Some("pro") => "Claude Pro".into(),
         Some(other) => format!("Claude {other}"),
         None => "Claude".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cooldown_left, set_cooldown, RATE_LIMIT_COOLDOWN};
+
+    #[test]
+    fn rate_limit_gate_holds_then_releases() {
+        set_cooldown(true);
+        let left = cooldown_left().expect("a cooldown must be running");
+        assert!(left <= RATE_LIMIT_COOLDOWN);
+        assert!(left > RATE_LIMIT_COOLDOWN - std::time::Duration::from_secs(5));
+        set_cooldown(false);
+        assert!(
+            cooldown_left().is_none(),
+            "a success must clear the cooldown"
+        );
     }
 }

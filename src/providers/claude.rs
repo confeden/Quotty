@@ -17,25 +17,63 @@ use std::path::PathBuf;
 // Token retrieval
 // ---------------------------------------------------------------------------
 
-/// Candidate Roaming-AppData bases. Different launch contexts (Explorer vs.
-/// shell, folder redirection) can make `dirs::config_dir()` disagree with the
-/// `APPDATA` env var, so we try several and validate on disk.
-fn candidate_bases() -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = Vec::new();
+/// Every directory Claude Desktop might keep its data in.
+///
+/// Two install kinds have to be covered:
+/// * the classic installer, which uses `%APPDATA%\Claude` — but different launch
+///   contexts can make `dirs::config_dir()` disagree with the `APPDATA` env var,
+///   so several roots are tried and validated on disk;
+/// * the Microsoft Store (MSIX) build, which never touches the real `%APPDATA%`
+///   at all. Inside its package container that path is redirected, so from any
+///   other process the data is at
+///   `%LOCALAPPDATA%\Packages\<package>\LocalCache\Roaming\Claude`.
+fn candidate_dirs() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(a) = std::env::var("APPDATA") {
-        v.push(PathBuf::from(a));
+        roots.push(PathBuf::from(a));
     }
     if let Some(c) = dirs::config_dir() {
-        v.push(c);
+        roots.push(c);
     }
     if let Ok(u) = std::env::var("USERPROFILE") {
-        v.push(PathBuf::from(u).join("AppData").join("Roaming"));
+        roots.push(PathBuf::from(u).join("AppData").join("Roaming"));
     }
     if let Some(h) = dirs::home_dir() {
-        v.push(h.join("AppData").join("Roaming"));
+        roots.push(h.join("AppData").join("Roaming"));
     }
-    v.dedup();
-    v
+    roots.dedup();
+
+    let mut dirs_list: Vec<PathBuf> = roots.into_iter().map(|r| r.join("Claude")).collect();
+    msix_dirs(&mut dirs_list);
+    dirs_list.dedup();
+    dirs_list
+}
+
+/// Data directories of Store-installed Claude packages.
+fn msix_dirs(out: &mut Vec<PathBuf>) {
+    let mut locals: Vec<PathBuf> = Vec::new();
+    if let Ok(l) = std::env::var("LOCALAPPDATA") {
+        locals.push(PathBuf::from(l));
+    }
+    if let Some(l) = dirs::data_local_dir() {
+        locals.push(l);
+    }
+    locals.dedup();
+
+    for local in locals {
+        let Ok(packages) = std::fs::read_dir(local.join("Packages")) else {
+            continue;
+        };
+        for entry in packages.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if !(name.starts_with("claude") || name.contains("anthropic")) {
+                continue;
+            }
+            let cache = entry.path().join("LocalCache");
+            out.push(cache.join("Roaming").join("Claude"));
+            out.push(cache.join("Local").join("Claude"));
+        }
+    }
 }
 
 struct ClaudeFiles {
@@ -61,20 +99,37 @@ fn read_with_retry(path: &std::path::Path) -> std::io::Result<String> {
 }
 
 /// Find the Claude Desktop data dir by actually reading its two files (not just
-/// `is_file()`, which is racy). Returns the first candidate that reads cleanly.
+/// `is_file()`, which is racy). With both a classic and a Store install present,
+/// the one whose `config.json` was written last wins — the other is a leftover
+/// holding a stale token.
 fn find_claude_files() -> Result<ClaudeFiles, String> {
     let mut diag: Vec<String> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
-    for base in candidate_bases() {
-        let dir = base.join("Claude");
+    let mut best: Option<(std::time::SystemTime, ClaudeFiles)> = None;
+
+    for dir in candidate_dirs() {
+        // Skip absent directories outright: retrying reads there would add up
+        // to half a second each, and there is nothing to race with.
+        let Ok(config_meta) = std::fs::metadata(dir.join("config.json")) else {
+            tried.push(dir.display().to_string());
+            continue;
+        };
         let ls = read_with_retry(&dir.join("Local State"));
         let cfg = read_with_retry(&dir.join("config.json"));
         match (ls, cfg) {
             (Ok(local_state), Ok(config)) => {
-                return Ok(ClaudeFiles {
-                    local_state,
-                    config,
-                });
+                let stamp = config_meta
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if best.as_ref().map_or(true, |(t, _)| stamp > *t) {
+                    best = Some((
+                        stamp,
+                        ClaudeFiles {
+                            local_state,
+                            config,
+                        },
+                    ));
+                }
             }
             (ls, cfg) => {
                 diag.push(format!(
@@ -86,6 +141,9 @@ fn find_claude_files() -> Result<ClaudeFiles, String> {
                 tried.push(dir.display().to_string());
             }
         }
+    }
+    if let Some((_, files)) = best {
+        return Ok(files);
     }
     // Only touch the log when we actually fail.
     dbg_log("--- find_claude_files() FAILED ---");

@@ -70,6 +70,14 @@ fn candidates() -> Vec<Endpoint> {
     files.sort_by(|a, b| b.seen.cmp(&a.seen));
     out.append(&mut files);
 
+    // Both files outlive the server they describe — the daemon descriptor on
+    // this machine names a port from months ago. Anything nobody is listening
+    // on would only buy a connect timeout.
+    let listening = crate::winproc::listening_ports();
+    if !listening.is_empty() {
+        out.retain(|e| listening.iter().any(|(_, port)| *port == e.port));
+    }
+
     out.dedup_by(|a, b| a.port == b.port && a.csrf == b.csrf);
     out
 }

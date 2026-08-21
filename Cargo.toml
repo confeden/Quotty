@@ -1,6 +1,6 @@
 [package]
 name = "quotty"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Quotty - a movable strip showing the quota and reset timers of the AI tool you are using"
 

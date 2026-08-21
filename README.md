@@ -1,6 +1,6 @@
 # Quotty
 
-Интерактивный счётчик лимитов нейросетей в минималистичном стиле.
+Интерактивный и удобный счётчик квот для Claude/Codex/Antigravity - показывает не только текущий расход лимита, но и то, насколько быстро вы его расходуете
 
 <img width="700" height="194" alt="quotty_demo" src="https://github.com/user-attachments/assets/4adfc8f7-5468-435d-bb2c-ce5a4624582a" />
 

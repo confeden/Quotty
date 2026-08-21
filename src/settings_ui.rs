@@ -70,6 +70,14 @@ pub fn apply_style(ctx: &egui::Context) {
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(10.0, 5.0);
     style.spacing.interact_size.y = 22.0;
+    // A solid, always-drawn bar: on a short screen the panel scrolls, and a
+    // floating bar that only appears on hover would not say so.
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
+    style.spacing.scroll.bar_width = 9.0;
+
+    // egui's own zoom shortcut (Ctrl+±) is not persisted, so an accidental one
+    // just leaves the strip the wrong size until a restart.
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
     let style: std::sync::Arc<egui::Style> = style.into();
     ctx.set_theme(egui::ThemePreference::Dark);
@@ -86,6 +94,7 @@ impl App {
         let mut refresh_now = false;
         let mut check_update = false;
         let mut content_h = self.settings_h;
+        let mut max_h = f32::INFINITY;
 
         let vid = egui::ViewportId::from_hash_of("quotty-settings");
         let builder = egui::ViewportBuilder::default()
@@ -106,21 +115,37 @@ impl App {
                         .inner_margin(egui::Margin::symmetric(14.0, 12.0)),
                 )
                 .show(ctx, |ui| {
+                    // The title bar stays outside the scroll area: on a screen
+                    // too short for the whole panel, ✕ must still be reachable.
                     close |= self.title_bar(ui, ctx);
-                    self.appearance_card(ui);
-                    self.sources_card(ui);
-                    refresh_now |= self.polling_card(ui);
-                    self.system_card(ui);
-                    check_update |= self.version_card(ui);
+                    let scrolled = egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                        )
+                        .show(ui, |ui| {
+                            self.appearance_card(ui);
+                            self.sources_card(ui);
+                            refresh_now |= self.polling_card(ui);
+                            self.system_card(ui);
+                            check_update |= self.version_card(ui);
 
-                    ui.add_space(8.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Закрыть").clicked() {
-                            close = true;
-                        }
-                    });
-                    // Fit the window to its content instead of guessing a height.
-                    content_h = ui.min_rect().height() + 24.0;
+                            ui.add_space(8.0);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Закрыть").clicked() {
+                                        close = true;
+                                    }
+                                },
+                            );
+                        });
+                    // Fit the window to its content instead of guessing a
+                    // height — `content_size` is the *unclamped* height, so this
+                    // does not feed back into itself once the window is capped.
+                    let head = scrolled.inner_rect.min.y - ui.max_rect().min.y;
+                    content_h = head + scrolled.content_size.y + 24.0;
+                    max_h = work_area_height(ctx, self.settings_area);
                 });
 
             if ctx.input(|i| i.viewport().close_requested())
@@ -130,8 +155,12 @@ impl App {
             }
         });
 
-        if (content_h - self.settings_h).abs() > 1.0 {
-            self.settings_h = content_h;
+        // Never grow past the screen: a taller panel would push its own title
+        // bar off the top and the buttons off the bottom, leaving no way to
+        // close it. The content scrolls instead.
+        let want_h = content_h.min(max_h);
+        if (want_h - self.settings_h).abs() > 1.0 {
+            self.settings_h = want_h;
             // Re-centre once the final size is known.
             self.settings_center = true;
         } else if self.settings_center && center_window(WIN_TITLE, self.settings_area) {
@@ -391,6 +420,20 @@ impl App {
 // ---------------------------------------------------------------------------
 // Small pieces
 // ---------------------------------------------------------------------------
+
+/// How tall the settings window may be, in points: the work area of the monitor
+/// it was opened on, less a margin. Falls back to egui's own monitor size (which
+/// includes the taskbar, hence the larger allowance).
+fn work_area_height(ctx: &egui::Context, area: Option<(i32, i32, i32, i32)>) -> f32 {
+    let ppp = ctx.pixels_per_point().max(0.1);
+    if let Some((_, top, _, bottom)) = area {
+        return (((bottom - top) as f32 / ppp) - 24.0).max(240.0);
+    }
+    match ctx.input(|i| i.viewport().monitor_size) {
+        Some(size) => (size.y - 96.0).max(240.0),
+        None => 700.0,
+    }
+}
 
 /// Section: a dim caption over a rounded card.
 fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {

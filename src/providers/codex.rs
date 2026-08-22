@@ -6,7 +6,7 @@
 //! a refresh is picked up. We never write to it — rotating the refresh token
 //! from here would sign the user out of Codex.
 
-use super::{dbg_log, diag, window_title, Family, FetchError, Limit, Snapshot};
+use super::{dbg_log, diag, window_title, Family, FetchError, Limit, LimitWindow, Snapshot};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -181,8 +181,10 @@ fn to_limit(w: Window, now: DateTime<Utc>) -> Option<Limit> {
     Some(Limit {
         title: window_title(span),
         used_percent: used,
-        window_start: resets_at - chrono::Duration::seconds(span),
-        resets_at,
+        window: Some(LimitWindow {
+            start: resets_at - chrono::Duration::seconds(span),
+            resets_at,
+        }),
     })
 }
 

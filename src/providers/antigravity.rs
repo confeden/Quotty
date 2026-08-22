@@ -7,7 +7,7 @@
 //! authenticates callers with a per-launch CSRF token, so we need both the port
 //! and that token, and we must skip certificate verification for it.
 
-use super::{dbg_log, diag, Family, FetchError, Limit, Snapshot};
+use super::{dbg_log, diag, Family, FetchError, Limit, LimitWindow, Snapshot};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -475,8 +475,10 @@ fn build_snapshot(status: UserStatus) -> Snapshot {
         limits.push(Limit {
             title: GROUP_TITLES[g].to_string(),
             used_percent: (1.0 - remaining) * 100.0,
-            window_start: resets_at - chrono::Duration::seconds(span),
-            resets_at,
+            window: Some(LimitWindow {
+                start: resets_at - chrono::Duration::seconds(span),
+                resets_at,
+            }),
         });
     }
 

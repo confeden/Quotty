@@ -5,7 +5,7 @@
 //! Covers Claude Code / the Claude CLI too: on Windows they run inside the
 //! Desktop app's account, so the same token and the same quota apply.
 
-use super::{dbg_log, diag, diagnostics_on, Family, FetchError, Limit, Snapshot};
+use super::{dbg_log, diag, diagnostics_on, Family, FetchError, Limit, LimitWindow, Snapshot};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -520,25 +520,28 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
 fn build_snapshot(usage: UsageResponse, tok: &OauthToken) -> Snapshot {
     let mut limits = Vec::new();
 
+    // A window that has not started yet arrives as `resets_at: null`. Keep the
+    // row — dropping it made the 5-hour limit vanish from the strip until the
+    // first request of the session.
     if let Some(w) = usage.five_hour {
-        if let Some(reset) = parse_ts(&w.resets_at) {
-            limits.push(Limit {
-                title: "5-hour limit".into(),
-                used_percent: w.utilization.unwrap_or(0.0) as f32,
-                window_start: reset - chrono::Duration::hours(5),
+        limits.push(Limit {
+            title: "5-hour limit".into(),
+            used_percent: w.utilization.unwrap_or(0.0) as f32,
+            window: parse_ts(&w.resets_at).map(|reset| LimitWindow {
+                start: reset - chrono::Duration::hours(5),
                 resets_at: reset,
-            });
-        }
+            }),
+        });
     }
     if let Some(w) = usage.seven_day {
-        if let Some(reset) = parse_ts(&w.resets_at) {
-            limits.push(Limit {
-                title: "Weekly · all models".into(),
-                used_percent: w.utilization.unwrap_or(0.0) as f32,
-                window_start: reset - chrono::Duration::days(7),
+        limits.push(Limit {
+            title: "Weekly · all models".into(),
+            used_percent: w.utilization.unwrap_or(0.0) as f32,
+            window: parse_ts(&w.resets_at).map(|reset| LimitWindow {
+                start: reset - chrono::Duration::days(7),
                 resets_at: reset,
-            });
-        }
+            }),
+        });
     }
 
     let plan = pretty_plan(tok.subscription.as_deref(), tok.tier.as_deref());
@@ -570,7 +573,7 @@ fn pretty_plan(sub: Option<&str>, tier: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cooldown_left, set_cooldown, RATE_LIMIT_COOLDOWN};
+    use super::{cooldown_left, set_cooldown, OauthToken, RATE_LIMIT_COOLDOWN};
 
     #[test]
     fn rate_limit_gate_holds_then_releases() {
@@ -583,5 +586,31 @@ mod tests {
             cooldown_left().is_none(),
             "a success must clear the cooldown"
         );
+    }
+
+    /// A 5-hour window only starts at the first request of a session; until
+    /// then the service sends `resets_at: null`. The row must still appear.
+    #[test]
+    fn a_window_that_has_not_started_still_makes_a_row() {
+        let usage: super::UsageResponse = serde_json::from_str(
+            r#"{"five_hour":{"utilization":0.0,"resets_at":null},
+                "seven_day":{"utilization":73.0,"resets_at":"2026-08-24T02:59:59+00:00"}}"#,
+        )
+        .expect("parse");
+        let token = OauthToken {
+            access: String::new(),
+            subscription: Some("max".into()),
+            tier: None,
+            source: "V2",
+        };
+
+        let snap = super::build_snapshot(usage, &token);
+        assert_eq!(snap.limits.len(), 2, "both rows belong on screen");
+        assert_eq!(snap.limits[0].title, "5-hour limit");
+        assert!(
+            snap.limits[0].window.is_none(),
+            "no clock for a window that has not started"
+        );
+        assert!(snap.limits[1].window.is_some(), "the weekly one is running");
     }
 }

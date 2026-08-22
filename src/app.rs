@@ -73,7 +73,7 @@ pub struct App {
     /// Height we last asked the OS for, so we only resize when it changes.
     applied_h: f32,
     /// Cached "Resets …" strings, refreshed at most once per second.
-    reset_cache: Vec<(String, String)>,
+    reset_cache: Vec<Option<(String, String)>>,
     reset_cache_sec: i64,
     /// Throttle for persisting the auto-switched family.
     last_family_save: f64,
@@ -386,10 +386,18 @@ impl App {
             status_col,
         );
         if dot {
+            // While throttled the dot breathes, so "подключение" reads as
+            // something still trying rather than something stuck.
+            let col = if stale {
+                let pulse = 0.45 + 0.55 * (0.5 + 0.5 * (anim_t * 2.2).sin() as f32);
+                status_col.gamma_multiply(pulse)
+            } else {
+                status_col
+            };
             painter.circle_filled(
                 Pos2::new(status_rect.left() - 6.0, status_rect.center().y),
                 3.0,
-                status_col,
+                col,
             );
         }
         y += 17.0;
@@ -402,12 +410,12 @@ impl App {
                 self.reset_cache = s
                     .limits
                     .iter()
-                    .map(|l| fmt_reset(l.resets_at, now))
+                    .map(|l| l.window.map(|w| fmt_reset(w.resets_at, now)))
                     .collect();
                 self.reset_cache_sec = sec;
             }
             for (i, lim) in s.limits.iter().enumerate() {
-                let reset = &self.reset_cache[i];
+                let reset = self.reset_cache[i].as_ref();
                 draw_limit(
                     &painter, lim, reset, left, right, y, now, op, text_a, dim, strong,
                     show_values, animate, anim_t, i,
@@ -524,6 +532,7 @@ fn spawn_poller(shared: Arc<Shared>, ctx: egui::Context) {
             if changed {
                 ctx.request_repaint();
             }
+            providers::flush_log();
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     });
@@ -561,7 +570,7 @@ fn spawn_update_checker(shared: Arc<Shared>, ctx: egui::Context) {
 fn draw_limit(
     painter: &egui::Painter,
     lim: &providers::Limit,
-    reset: &(String, String),
+    reset: Option<&(String, String)>,
     left: f32,
     right: f32,
     y: f32,
@@ -576,20 +585,26 @@ fn draw_limit(
     idx: usize,
 ) {
     {
-        let total = (lim.resets_at - lim.window_start).num_seconds().max(1) as f32;
-        let elapsed = (now - lim.window_start)
-            .num_seconds()
-            .clamp(0, total as i64) as f32;
-        let time_frac = (elapsed / total).clamp(0.0, 1.0);
+        // A limit whose window has not started has no clock to draw against:
+        // no time marker, no pace colours, no bubbles — just the (zero) fill.
+        let time_frac = match lim.window {
+            Some(w) => {
+                let total = (w.resets_at - w.start).num_seconds().max(1) as f32;
+                let elapsed = (now - w.start).num_seconds().clamp(0, total as i64) as f32;
+                (elapsed / total).clamp(0.0, 1.0)
+            }
+            None => 0.0,
+        };
+        let ticking = lim.window.is_some();
         let use_frac = (lim.used_percent / 100.0).clamp(0.0, 1.0);
         // Quota fully gone (100%) → whole bar orange. Spending faster than time
         // (but < 100%) → "overspend": freeze bubbles, paint the part past the
         // time marker dim-yellow.
         // Once a window has rolled over, the number we kept is no longer about
         // the window on screen — fall back to a dash even while paused.
-        let show = show_values && now < lim.resets_at;
+        let show = show_values && lim.window.map_or(true, |w| now < w.resets_at);
         let exhausted = lim.used_percent >= LIMIT_PCT;
-        let overspend = show && !exhausted && use_frac > time_frac + 0.02;
+        let overspend = ticking && show && !exhausted && use_frac > time_frac + 0.02;
 
         // Title line: name (left) + reset time (far right) + used% (left of it).
         painter.text(
@@ -599,11 +614,14 @@ fn draw_limit(
             FontId::proportional(12.5),
             strong,
         );
-        let (abs, rel) = reset;
+        let reset_text = match reset {
+            Some((abs, rel)) => format!("Resets {abs} · {rel}"),
+            None => "окно ещё не начато".to_string(),
+        };
         let reset_rect = painter.text(
             Pos2::new(right, y + 1.0),
             Align2::RIGHT_TOP,
-            format!("Resets {abs} · {rel}"),
+            reset_text,
             FontId::proportional(11.0),
             dim,
         );
@@ -670,7 +688,7 @@ fn draw_limit(
                     egui::Rounding::same(4.0),
                     green,
                 );
-                if animate && marker_x > use_end + 4.0 {
+                if animate && ticking && marker_x > use_end + 4.0 {
                     draw_bubbles_headroom(
                         painter,
                         use_end,
@@ -708,15 +726,17 @@ fn draw_limit(
             );
         }
 
-        // Vertical marker = current time position (always known).
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(marker_x - 1.0, ub_y - 2.0),
-                Pos2::new(marker_x + 1.0, ub_y + ub_h + 2.0),
-            ),
-            egui::Rounding::same(1.0),
-            Color32::from_rgba_unmultiplied(235, 238, 245, ((0.55 + 0.45 * op) * 255.0) as u8),
-        );
+        // Vertical marker = current time position, when there is a window.
+        if ticking {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(marker_x - 1.0, ub_y - 2.0),
+                    Pos2::new(marker_x + 1.0, ub_y + ub_h + 2.0),
+                ),
+                egui::Rounding::same(1.0),
+                Color32::from_rgba_unmultiplied(235, 238, 245, ((0.55 + 0.45 * op) * 255.0) as u8),
+            );
+        }
     }
 }
 
@@ -867,16 +887,18 @@ impl eframe::App for App {
             let n = s.last.as_ref().map(|s| s.limits.len().max(1)).unwrap_or(2);
             // Animate (when enabled) whenever offline, or online with a gap.
             let stale = !s.online && s.rate_limited && s.last.is_some();
-            let anim = if !animate_on {
+            let anim = if stale {
+                true
+            } else if !animate_on {
                 false
-            } else if !s.online && !stale {
+            } else if !s.online {
                 true
             } else if let Some(snap) = &s.last {
                 let now = Utc::now();
                 snap.limits.iter().any(|l| {
-                    let total = (l.resets_at - l.window_start).num_seconds().max(1) as f32;
-                    let elapsed =
-                        (now - l.window_start).num_seconds().clamp(0, total as i64) as f32;
+                    let Some(w) = l.window else { return false };
+                    let total = (w.resets_at - w.start).num_seconds().max(1) as f32;
+                    let elapsed = (now - w.start).num_seconds().clamp(0, total as i64) as f32;
                     let time_frac = elapsed / total;
                     let use_frac = (l.used_percent / 100.0).clamp(0.0, 1.0);
                     time_frac > use_frac + 0.02

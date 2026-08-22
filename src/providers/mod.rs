@@ -62,8 +62,42 @@ pub struct Snapshot {
     pub limits: Vec<Limit>,
 }
 
+/// Why a fetch failed. The distinction that matters to the UI is whether the
+/// numbers we already have are still meaningful: a throttled request says
+/// nothing about the quota itself, so the last values stay on screen.
+#[derive(Clone, Debug)]
+pub struct FetchError {
+    pub msg: String,
+    /// The service refused to answer *for now* (HTTP 429 or our own cooldown).
+    pub rate_limited: bool,
+}
+
+impl From<String> for FetchError {
+    fn from(msg: String) -> Self {
+        Self {
+            msg,
+            rate_limited: false,
+        }
+    }
+}
+
+impl From<&str> for FetchError {
+    fn from(msg: &str) -> Self {
+        Self::from(msg.to_string())
+    }
+}
+
+impl FetchError {
+    pub fn rate_limited(msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            rate_limited: true,
+        }
+    }
+}
+
 /// Fetch a fresh snapshot for one family.
-pub fn fetch(family: Family) -> Result<Snapshot, String> {
+pub fn fetch(family: Family) -> Result<Snapshot, FetchError> {
     match family {
         Family::Claude => claude::fetch(),
         Family::Codex => codex::fetch(),

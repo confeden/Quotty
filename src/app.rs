@@ -21,6 +21,19 @@ pub struct FetchState {
     pub online: bool,
     pub ever: bool,
     pub error: Option<String>,
+    /// The last poll failed only because the service is throttling us. The
+    /// numbers we already have are still true, so they stay on screen.
+    pub rate_limited: bool,
+}
+
+/// What the strip needs to know about the family it is drawing.
+struct ActiveState {
+    online: bool,
+    /// Values on screen are the last good ones; the service is throttling us.
+    stale: bool,
+    ever: bool,
+    last: Option<Snapshot>,
+    error: Option<String>,
 }
 
 /// `want`/`enabled` sentinel: no family singled out for an immediate poll.
@@ -316,7 +329,15 @@ impl App {
         let mut y = full.top() + 8.0;
 
         let now = Utc::now();
-        let (online, ever, last, err) = self.active_state();
+        let ActiveState {
+            online,
+            stale,
+            ever,
+            last,
+            error: err,
+        } = self.active_state();
+        // Both states draw real numbers; only the status word differs.
+        let show_values = online || stale;
 
         // Header: environment/plan (left) + online/offline status (right).
         let header = match self.settings.header_mode {
@@ -342,6 +363,12 @@ impl App {
             (
                 "онлайн",
                 Color32::from_rgba_unmultiplied(120, 205, 150, text_a),
+                true,
+            )
+        } else if stale {
+            (
+                "подключение",
+                Color32::from_rgba_unmultiplied(214, 200, 110, text_a),
                 true,
             )
         } else {
@@ -382,8 +409,8 @@ impl App {
             for (i, lim) in s.limits.iter().enumerate() {
                 let reset = &self.reset_cache[i];
                 draw_limit(
-                    &painter, lim, reset, left, right, y, now, op, text_a, dim, strong, online,
-                    animate, anim_t, i,
+                    &painter, lim, reset, left, right, y, now, op, text_a, dim, strong,
+                    show_values, animate, anim_t, i,
                 );
                 y += 34.0;
             }
@@ -427,13 +454,20 @@ impl App {
     }
 
     /// (online, ever, snapshot, error) of the family on screen.
-    fn active_state(&self) -> (bool, bool, Option<Snapshot>, Option<String>) {
+    fn active_state(&self) -> ActiveState {
         let st = self.shared.states.lock().unwrap();
         let s = &st[self.active.idx()];
         // Guard against a stale slot: only draw a snapshot that says it belongs
         // to the family we're showing.
         let last = s.last.clone().filter(|snap| snap.family == self.active);
-        (s.online, s.ever, last, s.error.clone())
+        ActiveState {
+            // Throttled with data in hand: keep showing it rather than dashes.
+            stale: !s.online && s.rate_limited && last.is_some(),
+            online: s.online,
+            ever: s.ever,
+            last,
+            error: s.error.clone(),
+        }
     }
 }
 
@@ -472,10 +506,12 @@ fn spawn_poller(shared: Arc<Shared>, ctx: egui::Context) {
                             s.online = true;
                             s.ever = true;
                             s.error = None;
+                            s.rate_limited = false;
                         }
                         Err(e) => {
                             s.online = false;
-                            s.error = Some(e);
+                            s.rate_limited = e.rate_limited;
+                            s.error = Some(e.msg);
                         }
                     }
                 }
@@ -534,7 +570,7 @@ fn draw_limit(
     text_a: u8,
     dim: Color32,
     strong: Color32,
-    online: bool,
+    show_values: bool,
     animate: bool,
     anim_t: f64,
     idx: usize,
@@ -549,8 +585,11 @@ fn draw_limit(
         // Quota fully gone (100%) → whole bar orange. Spending faster than time
         // (but < 100%) → "overspend": freeze bubbles, paint the part past the
         // time marker dim-yellow.
+        // Once a window has rolled over, the number we kept is no longer about
+        // the window on screen — fall back to a dash even while paused.
+        let show = show_values && now < lim.resets_at;
         let exhausted = lim.used_percent >= LIMIT_PCT;
-        let overspend = online && !exhausted && use_frac > time_frac + 0.02;
+        let overspend = show && !exhausted && use_frac > time_frac + 0.02;
 
         // Title line: name (left) + reset time (far right) + used% (left of it).
         painter.text(
@@ -568,12 +607,12 @@ fn draw_limit(
             FontId::proportional(11.0),
             dim,
         );
-        let pct_text = if online {
+        let pct_text = if show {
             format!("{:.0}%", lim.used_percent)
         } else {
             "—".to_string()
         };
-        let pct_col = if !online {
+        let pct_col = if !show {
             Color32::from_rgba_unmultiplied(150, 155, 165, text_a)
         } else {
             spend_text_color(exhausted, overspend, text_a)
@@ -604,7 +643,7 @@ fn draw_limit(
         let orange =
             Color32::from_rgba_unmultiplied(214, 150, 74, ((0.55 + 0.45 * op) * 255.0) as u8);
 
-        if online {
+        if show {
             let use_end = left + full_w * use_frac;
             if exhausted {
                 // Quota gone → the whole bar is dim-orange.
@@ -827,9 +866,10 @@ impl eframe::App for App {
             let s = &st[self.active.idx()];
             let n = s.last.as_ref().map(|s| s.limits.len().max(1)).unwrap_or(2);
             // Animate (when enabled) whenever offline, or online with a gap.
+            let stale = !s.online && s.rate_limited && s.last.is_some();
             let anim = if !animate_on {
                 false
-            } else if !s.online {
+            } else if !s.online && !stale {
                 true
             } else if let Some(snap) = &s.last {
                 let now = Utc::now();

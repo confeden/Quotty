@@ -6,7 +6,7 @@
 //! a refresh is picked up. We never write to it — rotating the refresh token
 //! from here would sign the user out of Codex.
 
-use super::{dbg_log, diag, window_title, Family, Limit, Snapshot};
+use super::{dbg_log, diag, window_title, Family, FetchError, Limit, Snapshot};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -102,7 +102,7 @@ struct Window {
     reset_at: Option<i64>,
 }
 
-pub fn fetch() -> Result<Snapshot, String> {
+pub fn fetch() -> Result<Snapshot, FetchError> {
     let auth = load_auth()?;
 
     let mut req = ureq::get(USAGE_URL)
@@ -125,13 +125,19 @@ pub fn fetch() -> Result<Snapshot, String> {
         Err(ureq::Error::Status(401, _)) => {
             return Err("токен Codex устарел — откройте Codex".into())
         }
+        Err(ureq::Error::Status(429, _)) => {
+            diag("codex: status 429 (rate limited)");
+            // Same reasoning as Claude: the numbers we already have are still
+            // good, the service just refuses to talk right now.
+            return Err(FetchError::rate_limited("лимит запросов OpenAI"));
+        }
         Err(ureq::Error::Status(code, _)) => {
             diag(&format!("codex: status {code}"));
-            return Err(format!("status {code}"));
+            return Err(format!("status {code}").into());
         }
         Err(e) => {
             diag(&format!("codex: network error ({e})"));
-            return Err(format!("network: {e}"));
+            return Err(format!("network: {e}").into());
         }
     };
 

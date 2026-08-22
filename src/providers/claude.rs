@@ -5,7 +5,7 @@
 //! Covers Claude Code / the Claude CLI too: on Windows they run inside the
 //! Desktop app's account, so the same token and the same quota apply.
 
-use super::{dbg_log, diag, diagnostics_on, Family, Limit, Snapshot};
+use super::{dbg_log, diag, diagnostics_on, Family, FetchError, Limit, Snapshot};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -442,12 +442,12 @@ fn endpoint_ip() -> String {
 
 /// Fetch a fresh snapshot: reads tokens from disk and tries each against the
 /// usage endpoint until one succeeds.
-pub fn fetch() -> Result<Snapshot, String> {
+pub fn fetch() -> Result<Snapshot, FetchError> {
     if let Some(left) = cooldown_left() {
-        return Err(format!(
+        return Err(FetchError::rate_limited(format!(
             "лимит запросов, пауза {} мин",
             (left.as_secs() / 60) + 1
-        ));
+        )));
     }
     let mut tokens = load_tokens()?;
 
@@ -505,14 +505,16 @@ pub fn fetch() -> Result<Snapshot, String> {
                             "claude: rate limited, sleeping {}s",
                             wait.as_secs()
                         ));
-                        return Err(format!("лимит запросов, пауза {mins} мин"));
+                        return Err(FetchError::rate_limited(format!(
+                            "лимит запросов, пауза {mins} мин"
+                        )));
                     }
                 }
             }
         }
     }
     *LAST_GOOD.lock().unwrap() = None;
-    Err(format!("usage request: {last_err}"))
+    Err(format!("usage request: {last_err}").into())
 }
 
 fn build_snapshot(usage: UsageResponse, tok: &OauthToken) -> Snapshot {

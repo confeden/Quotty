@@ -7,7 +7,7 @@
 //! authenticates callers with a per-launch CSRF token, so we need both the port
 //! and that token, and we must skip certificate verification for it.
 
-use super::{dbg_log, diag, Family, Limit, Snapshot};
+use super::{dbg_log, diag, Family, FetchError, Limit, Snapshot};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -368,7 +368,7 @@ struct QuotaInfo {
     reset_time: Option<serde_json::Value>,
 }
 
-pub fn fetch() -> Result<Snapshot, String> {
+pub fn fetch() -> Result<Snapshot, FetchError> {
     let eps = candidates();
     if eps.is_empty() {
         return Err("Antigravity не запущен".into());
@@ -398,7 +398,7 @@ pub fn fetch() -> Result<Snapshot, String> {
         "antigravity: {} endpoint(s) tried, last error: {last_err}",
         eps.len()
     ));
-    Err(format!("Antigravity не отвечает ({last_err})"))
+    Err(format!("Antigravity не отвечает ({last_err})").into())
 }
 
 fn call(ep: &Endpoint) -> Result<UserStatus, String> {

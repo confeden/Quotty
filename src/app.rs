@@ -600,9 +600,12 @@ fn draw_limit(
         // Quota fully gone (100%) → whole bar orange. Spending faster than time
         // (but < 100%) → "overspend": freeze bubbles, paint the part past the
         // time marker dim-yellow.
-        // Once a window has rolled over, the number we kept is no longer about
-        // the window on screen — fall back to a dash even while paused.
-        let show = show_values && lim.window.map_or(true, |w| now < w.resets_at);
+        // A window can run out between two polls: what we hold is still the
+        // last truth about it, and the next poll (a minute away) brings the new
+        // one. Keep showing it for a grace period; only a long silence — a
+        // throttle that outlives the window — makes the number meaningless.
+        let past_reset = lim.window.map(|w| now - w.resets_at);
+        let show = show_values && past_reset.map_or(true, |d| d < RESET_GRACE);
         let exhausted = lim.used_percent >= LIMIT_PCT;
         let overspend = ticking && show && !exhausted && use_frac > time_frac + 0.02;
 
@@ -740,6 +743,11 @@ fn draw_limit(
     }
 }
 
+/// How long a limit keeps showing its last percentage after its window was due
+/// to reset. Longer than any poll interval that still refreshes promptly, short
+/// enough that a throttled source cannot pass off yesterday's number as today's.
+const RESET_GRACE: Duration = Duration::minutes(10);
+
 /// Percent at/above which a limit is considered "reached" → dim-orange.
 const LIMIT_PCT: f32 = 100.0;
 
@@ -861,8 +869,16 @@ fn fmt_reset(reset: DateTime<Utc>, now: DateTime<Utc>) -> (String, String) {
         format!("{}d {}h", mins / 1440, (mins % 1440) / 60)
     } else if mins >= 60 {
         format!("{}h {}m", mins / 60, mins % 60)
+    } else if rem > Duration::zero() {
+        // "0m" read as "already reset" while the quota was still counting.
+        if mins == 0 {
+            "<1m".to_string()
+        } else {
+            format!("{mins}m")
+        }
     } else {
-        format!("{}m", mins)
+        // The clock ran out; the next poll brings the new window.
+        "обновление…".to_string()
     };
     (abs, rel)
 }
@@ -976,5 +992,26 @@ impl eframe::App for App {
             }
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(period as u64));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_reset;
+    use chrono::{Duration, Utc};
+
+    /// The window is still counting until its reset actually passes: rounding
+    /// the last seconds down to "0m" read as "already reset".
+    #[test]
+    fn the_last_minute_is_not_zero_minutes() {
+        let now = Utc::now();
+        let rel = |secs: i64| fmt_reset(now + Duration::seconds(secs), now).1;
+
+        assert_eq!(rel(40), "<1m", "under a minute still has time left");
+        assert_eq!(rel(95), "1m");
+        assert_eq!(rel(2 * 3600 + 5 * 60), "2h 5m");
+        assert_eq!(rel(25 * 3600), "1d 1h");
+        assert_eq!(rel(0), "обновление…", "the clock ran out, wait for a poll");
+        assert_eq!(rel(-30), "обновление…");
     }
 }

@@ -417,8 +417,21 @@ impl App {
             for (i, lim) in s.limits.iter().enumerate() {
                 let reset = self.reset_cache[i].as_ref();
                 draw_limit(
-                    &painter, lim, reset, left, right, y, now, op, text_a, dim, strong,
-                    show_values, animate, anim_t, i,
+                    &painter,
+                    lim,
+                    reset,
+                    left,
+                    right,
+                    y,
+                    now,
+                    op,
+                    text_a,
+                    dim,
+                    strong,
+                    show_values,
+                    animate,
+                    anim_t,
+                    i,
                 );
                 y += 34.0;
             }
@@ -585,17 +598,10 @@ fn draw_limit(
     idx: usize,
 ) {
     {
-        // A limit whose window has not started has no clock to draw against:
-        // no time marker, no pace colours, no bubbles — just the (zero) fill.
-        let time_frac = match lim.window {
-            Some(w) => {
-                let total = (w.resets_at - w.start).num_seconds().max(1) as f32;
-                let elapsed = (now - w.start).num_seconds().clamp(0, total as i64) as f32;
-                (elapsed / total).clamp(0.0, 1.0)
-            }
-            None => 0.0,
-        };
-        let ticking = lim.window.is_some();
+        // No window at all (the service has not opened one) → no clock: no time
+        // marker, no pace colours, no bubbles. A window whose start we could not
+        // place stands at its very beginning instead (D10, `marker_frac`).
+        let time_frac = lim.window.map(|w| w.marker_frac(now));
         let use_frac = (lim.used_percent / 100.0).clamp(0.0, 1.0);
         // Quota fully gone (100%) → whole bar orange. Spending faster than time
         // (but < 100%) → "overspend": freeze bubbles, paint the part past the
@@ -607,7 +613,7 @@ fn draw_limit(
         let past_reset = lim.window.map(|w| now - w.resets_at);
         let show = show_values && past_reset.map_or(true, |d| d < RESET_GRACE);
         let exhausted = lim.used_percent >= LIMIT_PCT;
-        let overspend = ticking && show && !exhausted && use_frac > time_frac + 0.02;
+        let overspend = show && !exhausted && time_frac.is_some_and(|t| use_frac > t + 0.02);
 
         // Title line: name (left) + reset time (far right) + used% (left of it).
         painter.text(
@@ -655,7 +661,8 @@ fn draw_limit(
         let ub_track = Rect::from_min_max(Pos2::new(left, ub_y), Pos2::new(right, ub_y + ub_h));
         painter.rect_filled(ub_track, egui::Rounding::same(4.0), track_col);
 
-        let marker_x = left + full_w * time_frac;
+        // Where the time marker sits — nowhere, when the window has no clock.
+        let marker_x = time_frac.map(|t| left + full_w * t);
 
         let green =
             Color32::from_rgba_unmultiplied(96, 196, 132, ((0.55 + 0.45 * op) * 255.0) as u8);
@@ -669,16 +676,16 @@ fn draw_limit(
             if exhausted {
                 // Quota gone → the whole bar is dim-orange.
                 painter.rect_filled(ub_track, egui::Rounding::same(4.0), orange);
-            } else if overspend {
+            } else if let Some(mx) = marker_x.filter(|_| overspend) {
                 // Green up to the time marker, dim-yellow for the overspend
                 // (marker → spend edge). No bubbles.
                 painter.rect_filled(
-                    Rect::from_min_max(ub_track.min, Pos2::new(marker_x, ub_y + ub_h)),
+                    Rect::from_min_max(ub_track.min, Pos2::new(mx, ub_y + ub_h)),
                     egui::Rounding::same(4.0),
                     green,
                 );
                 painter.rect_filled(
-                    Rect::from_min_max(Pos2::new(marker_x, ub_y), Pos2::new(use_end, ub_y + ub_h)),
+                    Rect::from_min_max(Pos2::new(mx, ub_y), Pos2::new(use_end, ub_y + ub_h)),
                     egui::Rounding::same(4.0),
                     yellow,
                 );
@@ -691,11 +698,11 @@ fn draw_limit(
                     egui::Rounding::same(4.0),
                     green,
                 );
-                if animate && ticking && marker_x > use_end + 4.0 {
+                if let Some(mx) = marker_x.filter(|mx| animate && *mx > use_end + 4.0) {
                     draw_bubbles_headroom(
                         painter,
                         use_end,
-                        marker_x,
+                        mx,
                         0.33 * full_w, // dissolve within ≤33% of the bar
                         ub_y,
                         ub_h,
@@ -729,12 +736,12 @@ fn draw_limit(
             );
         }
 
-        // Vertical marker = current time position, when there is a window.
-        if ticking {
+        // Vertical marker = current time position, when there is a clock.
+        if let Some(mx) = marker_x {
             painter.rect_filled(
                 Rect::from_min_max(
-                    Pos2::new(marker_x - 1.0, ub_y - 2.0),
-                    Pos2::new(marker_x + 1.0, ub_y + ub_h + 2.0),
+                    Pos2::new(mx - 1.0, ub_y - 2.0),
+                    Pos2::new(mx + 1.0, ub_y + ub_h + 2.0),
                 ),
                 egui::Rounding::same(1.0),
                 Color32::from_rgba_unmultiplied(235, 238, 245, ((0.55 + 0.45 * op) * 255.0) as u8),
@@ -912,10 +919,11 @@ impl eframe::App for App {
             } else if let Some(snap) = &s.last {
                 let now = Utc::now();
                 snap.limits.iter().any(|l| {
-                    let Some(w) = l.window else { return false };
-                    let total = (w.resets_at - w.start).num_seconds().max(1) as f32;
-                    let elapsed = (now - w.start).num_seconds().clamp(0, total as i64) as f32;
-                    let time_frac = elapsed / total;
+                    // Same clock as `draw_limit`: an unplaceable start reads as
+                    // "at the beginning", which is never ahead of the spend.
+                    let Some(time_frac) = l.window.map(|w| w.marker_frac(now)) else {
+                        return false;
+                    };
                     let use_frac = (l.used_percent / 100.0).clamp(0.0, 1.0);
                     time_frac > use_frac + 0.02
                 })

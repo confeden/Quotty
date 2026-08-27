@@ -177,14 +177,12 @@ fn to_limit(w: Window, now: DateTime<Utc>) -> Option<Limit> {
     // so fall back to "the window started when we first saw it".
     let span = w
         .limit_window_seconds
-        .unwrap_or_else(|| (resets_at - now).num_seconds().max(1));
+        .map(chrono::Duration::seconds)
+        .unwrap_or_else(|| (resets_at - now).max(chrono::Duration::seconds(1)));
     Some(Limit {
-        title: window_title(span),
+        title: window_title(span.num_seconds()),
         used_percent: used,
-        window: Some(LimitWindow {
-            start: resets_at - chrono::Duration::seconds(span),
-            resets_at,
-        }),
+        window: Some(LimitWindow::ending_at(resets_at, span, now)),
     })
 }
 

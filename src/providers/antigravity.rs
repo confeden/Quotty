@@ -468,17 +468,19 @@ fn build_snapshot(status: UserStatus) -> Snapshot {
             continue;
         };
         let resets_at = reset.unwrap_or(now + chrono::Duration::seconds(WINDOW_SECS));
-        // The RPC gives no window start; quotas roll over every 5 hours, but if
-        // a reset is further out than that, trust the reset and stretch the
-        // window so the time marker stays inside the bar.
-        let span = WINDOW_SECS.max((resets_at - now).num_seconds());
+        // The RPC gives no window start; quotas roll over every 5 hours, so the
+        // start is derived from that. A reset further out than 5 hours means the
+        // assumption does not hold for this row — `ending_at` then leaves the
+        // start unplaced rather than pretending the window began now, which put
+        // the time marker at zero and made any spend look like overspending.
         limits.push(Limit {
             title: GROUP_TITLES[g].to_string(),
             used_percent: (1.0 - remaining) * 100.0,
-            window: Some(LimitWindow {
-                start: resets_at - chrono::Duration::seconds(span),
+            window: Some(LimitWindow::ending_at(
                 resets_at,
-            }),
+                chrono::Duration::seconds(WINDOW_SECS),
+                now,
+            )),
         });
     }
 

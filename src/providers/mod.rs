@@ -59,8 +59,44 @@ pub struct Limit {
 #[derive(Clone, Copy, Debug)]
 pub struct LimitWindow {
     /// Synthesized as `resets_at` minus the window length; no API returns it.
-    pub start: DateTime<Utc>,
+    /// `None` when that subtraction lands in the future — the reset is further
+    /// out than the window is long, which nothing about the window can explain
+    /// (a local clock running behind will do it, G25). A start we cannot place
+    /// is left unplaced here; drawing it is the UI's call (`marker_frac`, D10).
+    pub start: Option<DateTime<Utc>>,
     pub resets_at: DateTime<Utc>,
+}
+
+impl LimitWindow {
+    /// A window of known length ending at `resets_at`.
+    pub fn ending_at(
+        resets_at: DateTime<Utc>,
+        len: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> LimitWindow {
+        let start = resets_at - len;
+        LimitWindow {
+            start: (start <= now).then_some(start),
+            resets_at,
+        }
+    }
+
+    /// Where the time marker goes, 0..=1. A window we could not place stands at
+    /// the very beginning of the bar, so everything already spent counts as
+    /// spend ahead of the clock — the owner's rule for the case where the reset
+    /// cannot be reconciled with the window's length (D10, G25).
+    pub fn marker_frac(&self, now: DateTime<Utc>) -> f32 {
+        self.elapsed_frac(now).unwrap_or(0.0)
+    }
+
+    /// How far through the window we are, 0..=1. `None` when there is no
+    /// placeable start, i.e. nothing that can honestly be called progress.
+    pub fn elapsed_frac(&self, now: DateTime<Utc>) -> Option<f32> {
+        let start = self.start?;
+        let total = (self.resets_at - start).num_seconds().max(1);
+        let elapsed = (now - start).num_seconds().clamp(0, total);
+        Some((elapsed as f32 / total as f32).clamp(0.0, 1.0))
+    }
 }
 
 #[derive(Clone, Debug)]

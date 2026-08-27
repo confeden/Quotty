@@ -351,15 +351,16 @@ enum Failure {
     NextToken,
     /// Nothing else will work this poll (transport error, bad response).
     Stop,
-    /// The endpoint is throttling this account or IP. Every other token would
-    /// get the same answer, and asking again soon only deepens it. Carries the
-    /// server's own `Retry-After`, in seconds, when it sent one.
+    /// The endpoint refused this request as too frequent. Carries the server's
+    /// own `Retry-After`, in seconds, when it sent one. Another entry may still
+    /// be answered — the refusal is not always account-wide — but if they all
+    /// come back like this, asking again soon only deepens it.
     RateLimited(Option<u64>),
 }
 
-/// The endpoint answers 429 per account/IP, not per token, so a burst of
-/// retries is what keeps it there. Sit out sending nothing — for as long as the
-/// server asked, if it said, and five minutes if it did not.
+/// How long to sit out sending nothing once *every* token has been refused —
+/// for as long as the server asked, if it said something usable, and five
+/// minutes if it did not.
 const RATE_LIMIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
 /// Anthropic has been seen asking for 2708 s; anything beyond an hour is more
 /// likely a broken header than a real ban.
@@ -376,9 +377,13 @@ fn set_cooldown(on: bool) {
     *COOLDOWN_UNTIL.lock().unwrap() = on.then(|| std::time::Instant::now() + RATE_LIMIT_COOLDOWN);
 }
 
-/// Start a cooldown of the length the server asked for.
+/// Start a cooldown of the length the server asked for. A `Retry-After: 0` is
+/// not an invitation to retry immediately — it is the header carrying nothing,
+/// and taking it at face value turned the cooldown into a 30-second one that
+/// re-asked the refusing endpoint all day. Treat it as absent.
 fn set_cooldown_secs(retry_after: Option<u64>) -> std::time::Duration {
     let secs = retry_after
+        .filter(|s| *s > 0)
         .unwrap_or(RATE_LIMIT_COOLDOWN.as_secs())
         .clamp(30, RATE_LIMIT_MAX);
     let wait = std::time::Duration::from_secs(secs);
@@ -472,6 +477,10 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
     }
 
     let mut last_err = "no token tried".to_string();
+    // Set once some entry was refused as too frequent, holding the longest
+    // `Retry-After` any of them asked for. Only a poll where *nothing* got
+    // through starts a cooldown.
+    let mut throttled: Option<Option<u64>> = None;
     for tok in &tokens {
         let started = std::time::Instant::now();
         match request_usage(&tok.access) {
@@ -497,51 +506,63 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
                 match what {
                     Failure::NextToken => continue,
                     Failure::Stop => break,
+                    // Not necessarily account-wide: config.json can hold an
+                    // entry the endpoint keeps refusing while the next one is
+                    // answered in the same second. Treating the first 429 as
+                    // final left the strip on a stale number for a whole day.
                     Failure::RateLimited(retry_after) => {
-                        let wait = set_cooldown_secs(retry_after);
-                        *LAST_GOOD.lock().unwrap() = None;
-                        let mins = (wait.as_secs() / 60).max(1);
-                        diag(&format!(
-                            "claude: rate limited, sleeping {}s",
-                            wait.as_secs()
-                        ));
-                        return Err(FetchError::rate_limited(format!(
-                            "лимит запросов, пауза {mins} мин"
-                        )));
+                        let longest = throttled.unwrap_or(None).max(retry_after);
+                        throttled = Some(longest);
+                        continue;
                     }
                 }
             }
         }
     }
     *LAST_GOOD.lock().unwrap() = None;
+    if let Some(retry_after) = throttled {
+        let wait = set_cooldown_secs(retry_after);
+        let mins = (wait.as_secs() / 60).max(1);
+        diag(&format!(
+            "claude: every token rate limited, sleeping {}s",
+            wait.as_secs()
+        ));
+        return Err(FetchError::rate_limited(format!(
+            "лимит запросов, пауза {mins} мин"
+        )));
+    }
     Err(format!("usage request: {last_err}").into())
 }
 
 fn build_snapshot(usage: UsageResponse, tok: &OauthToken) -> Snapshot {
+    let now = Utc::now();
     let mut limits = Vec::new();
 
     // A window that has not started yet arrives as `resets_at: null`. Keep the
     // row — dropping it made the 5-hour limit vanish from the strip until the
     // first request of the session.
+    //
+    // The start is *derived*, so it can land ahead of `now`: on a machine whose
+    // clock runs behind, every reset looks further out than its window is long
+    // (G25). `ending_at` decides what to do with a start it cannot place.
     if let Some(w) = usage.five_hour {
         limits.push(Limit {
             title: "5-hour limit".into(),
             used_percent: w.utilization.unwrap_or(0.0) as f32,
-            window: parse_ts(&w.resets_at).map(|reset| LimitWindow {
-                start: reset - chrono::Duration::hours(5),
-                resets_at: reset,
-            }),
+            window: parse_ts(&w.resets_at)
+                .map(|reset| LimitWindow::ending_at(reset, chrono::Duration::hours(5), now)),
         });
     }
     if let Some(w) = usage.seven_day {
         limits.push(Limit {
             title: "Weekly · all models".into(),
             used_percent: w.utilization.unwrap_or(0.0) as f32,
-            window: parse_ts(&w.resets_at).map(|reset| LimitWindow {
-                start: reset - chrono::Duration::days(7),
-                resets_at: reset,
-            }),
+            window: parse_ts(&w.resets_at)
+                .map(|reset| LimitWindow::ending_at(reset, chrono::Duration::days(7), now)),
         });
+    }
+    for l in &limits {
+        diag(&format!("claude: {}", describe(l, now)));
     }
 
     let plan = pretty_plan(tok.subscription.as_deref(), tok.tier.as_deref());
@@ -550,6 +571,24 @@ fn build_snapshot(usage: UsageResponse, tok: &OauthToken) -> Snapshot {
         plan,
         limits,
     }
+}
+
+/// One limit as the log wants it: the numbers the strip drew and where they came
+/// from, so "why is that row shaped like that" is answerable after the fact.
+fn describe(l: &Limit, now: DateTime<Utc>) -> String {
+    let when = match l.window {
+        None => "no window".to_string(),
+        Some(w) => format!(
+            "resets {} (in {} min), start {}",
+            w.resets_at.to_rfc3339(),
+            (w.resets_at - now).num_minutes(),
+            match w.start {
+                Some(s) => s.to_rfc3339(),
+                None => "unplaceable — reset is further out than the window".into(),
+            }
+        ),
+    };
+    format!("{} {:.0}%, {when}", l.title, l.used_percent)
 }
 
 fn pretty_plan(sub: Option<&str>, tier: Option<&str>) -> String {
@@ -597,14 +636,8 @@ mod tests {
                 "seven_day":{"utilization":73.0,"resets_at":"2026-08-24T02:59:59+00:00"}}"#,
         )
         .expect("parse");
-        let token = OauthToken {
-            access: String::new(),
-            subscription: Some("max".into()),
-            tier: None,
-            source: "V2",
-        };
 
-        let snap = super::build_snapshot(usage, &token);
+        let snap = super::build_snapshot(usage, &a_token());
         assert_eq!(snap.limits.len(), 2, "both rows belong on screen");
         assert_eq!(snap.limits[0].title, "5-hour limit");
         assert!(
@@ -612,5 +645,78 @@ mod tests {
             "no clock for a window that has not started"
         );
         assert!(snap.limits[1].window.is_some(), "the weekly one is running");
+    }
+
+    /// A `five_hour` counter that clears in seven — what a local clock hours
+    /// behind does to every countdown (G25). The row keeps its reset time,
+    /// claims no start it cannot know, and puts its time marker at the beginning
+    /// of the bar, so what is already spent reads as spend ahead of it (D10).
+    #[test]
+    fn a_reset_beyond_the_window_leaves_the_start_unplaced() {
+        let reset = chrono::Utc::now() + chrono::Duration::minutes(7 * 60);
+        let usage: super::UsageResponse = serde_json::from_str(&format!(
+            r#"{{"five_hour":{{"utilization":12.0,"resets_at":"{}"}}}}"#,
+            reset.to_rfc3339()
+        ))
+        .expect("parse");
+
+        let snap = super::build_snapshot(usage, &a_token());
+        let w = snap.limits[0]
+            .window
+            .expect("the reset time is still known");
+        assert_eq!(w.resets_at.timestamp(), reset.timestamp());
+        assert!(w.start.is_none(), "a start in the future is not a start");
+        let now = chrono::Utc::now();
+        assert!(
+            w.elapsed_frac(now).is_none(),
+            "and nothing that can be called progress"
+        );
+        assert_eq!(w.marker_frac(now), 0.0, "the marker goes to the left edge");
+        assert!(
+            snap.limits[0].used_percent / 100.0 > w.marker_frac(now) + 0.02,
+            "so the spend is past the marker — the bar reads as overspend"
+        );
+    }
+
+    /// Not a test — the tool that answers "what does the service actually say".
+    /// Ignored, because it spends a real request against the live endpoint:
+    /// `cargo test --release probe_usage_body -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn probe_usage_body() {
+        println!("now utc = {}", chrono::Utc::now().to_rfc3339());
+        for tok in &super::load_tokens().expect("tokens") {
+            match ureq::get("https://api.anthropic.com/api/oauth/usage")
+                .set("Authorization", &format!("Bearer {}", tok.access))
+                .set("anthropic-beta", "oauth-2025-04-20")
+                .set("anthropic-version", "2023-06-01")
+                .set("User-Agent", "Quotty/0.1")
+                .timeout(std::time::Duration::from_secs(20))
+                .call()
+            {
+                Ok(resp) => {
+                    println!(
+                        "{}: 200 {}",
+                        tok.source,
+                        resp.into_string().unwrap_or_default()
+                    );
+                    return;
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let retry = resp.header("retry-after").map(str::to_string);
+                    println!("{}: status {code}, retry-after {retry:?}", tok.source);
+                }
+                Err(e) => println!("{}: {e}", tok.source),
+            }
+        }
+    }
+
+    fn a_token() -> OauthToken {
+        OauthToken {
+            access: String::new(),
+            subscription: Some("max".into()),
+            tier: None,
+            source: "V2",
+        }
     }
 }

@@ -347,15 +347,6 @@ impl App {
         let full = ui.max_rect();
         let painter = ui.painter().clone();
 
-        // Translucent rounded background drawn exactly to applied_h (anchored at top).
-        let bg_h = if self.applied_h > 0.0 { self.applied_h } else { full.height() };
-        let strip_rect = Rect::from_min_size(full.min, Vec2::new(full.width(), bg_h));
-        painter.rect_filled(
-            strip_rect,
-            egui::Rounding::same(8.0),
-            Color32::from_rgba_unmultiplied(22, 24, 30, (op * 235.0) as u8),
-        );
-
         let text_a = ((0.35 + 0.65 * op) * 255.0) as u8;
         let dim = Color32::from_rgba_unmultiplied(190, 196, 210, text_a);
         let strong = Color32::from_rgba_unmultiplied(232, 236, 245, text_a);
@@ -379,13 +370,14 @@ impl App {
         let all_limits = last.as_ref().map(|s| s.limits.as_slice()).unwrap_or(&[]);
         let (active_indices, exhausted_indices): (Vec<usize>, Vec<usize>) = (0..all_limits.len())
             .partition(|&i| all_limits[i].used_percent < LIMIT_PCT);
+        let all_exhausted = active_indices.is_empty();
 
         let (visible_indices, hidden_exhausted): (Vec<usize>, Vec<usize>) = match self.settings.exhausted_mode {
             crate::config::ExhaustedMode::Full | crate::config::ExhaustedMode::Compact => {
                 ((0..all_limits.len()).collect(), Vec::new())
             }
             crate::config::ExhaustedMode::Hidden => {
-                if active_indices.is_empty() {
+                if all_exhausted {
                     // All exhausted: keep showing so the window is never empty
                     ((0..all_limits.len()).collect(), Vec::new())
                 } else {
@@ -393,6 +385,28 @@ impl App {
                 }
             }
         };
+
+        // Determine content height so the background never cuts off content
+        let mut rows_h = 0.0f32;
+        if show_values && !visible_indices.is_empty() {
+            for &i in &visible_indices {
+                let lim = &all_limits[i];
+                let is_compact = lim.used_percent >= LIMIT_PCT
+                    && (self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact
+                        || (self.settings.exhausted_mode == crate::config::ExhaustedMode::Hidden && all_exhausted));
+                rows_h += if is_compact { 18.0 } else { 34.0 };
+            }
+        } else {
+            rows_h = 18.0;
+        }
+        let content_h = 18.0 + 17.0 + rows_h; // pad_h + header_h + rows_h
+        let bg_h = content_h.max(self.applied_h);
+        let strip_rect = Rect::from_min_size(full.min, Vec2::new(full.width(), bg_h));
+        painter.rect_filled(
+            strip_rect,
+            egui::Rounding::same(8.0),
+            Color32::from_rgba_unmultiplied(22, 24, 30, (op * 235.0) as u8),
+        );
 
         // Cache reset times
         let sec = now.timestamp();
@@ -522,7 +536,8 @@ impl App {
                 let lim = &all_limits[i];
                 let reset = self.reset_cache.get(i).and_then(|r| r.as_ref());
                 let is_compact = lim.used_percent >= LIMIT_PCT
-                    && self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact;
+                    && (self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact
+                        || (self.settings.exhausted_mode == crate::config::ExhaustedMode::Hidden && all_exhausted));
                 let row_h = draw_limit(
                     &painter,
                     lim,
@@ -1059,12 +1074,13 @@ impl eframe::App for App {
             let (h, anim) = if let (true, Some(snap)) = (show_values, last) {
                 let all_limits = &snap.limits;
                 let active_limits: Vec<_> = all_limits.iter().filter(|l| l.used_percent < LIMIT_PCT).collect();
+                let all_exhausted = active_limits.is_empty();
                 let visible_limits: Vec<&providers::Limit> = match self.settings.exhausted_mode {
                     crate::config::ExhaustedMode::Full | crate::config::ExhaustedMode::Compact => {
                         all_limits.iter().collect()
                     }
                     crate::config::ExhaustedMode::Hidden => {
-                        if active_limits.is_empty() {
+                        if all_exhausted {
                             all_limits.iter().collect()
                         } else {
                             active_limits
@@ -1075,7 +1091,8 @@ impl eframe::App for App {
                 let mut rows_h = 0.0f32;
                 for lim in &visible_limits {
                     let is_compact = lim.used_percent >= LIMIT_PCT
-                        && self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact;
+                        && (self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact
+                            || (self.settings.exhausted_mode == crate::config::ExhaustedMode::Hidden && all_exhausted));
                     rows_h += if is_compact { 18.0 } else { 34.0 };
                 }
 
@@ -1120,7 +1137,7 @@ impl eframe::App for App {
             if let Some(h) = self.hwnd {
                 use windows::Win32::Foundation::HWND;
                 use windows::Win32::UI::WindowsAndMessaging::{
-                    SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+                    SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER,
                 };
                 let ppp = ctx.pixels_per_point();
                 let phys_w = (430.0 * ppp).round() as i32;
@@ -1128,12 +1145,12 @@ impl eframe::App for App {
                 unsafe {
                     let _ = SetWindowPos(
                         HWND(h as *mut _),
-                        HWND_TOPMOST,
+                        HWND::default(),
                         0,
                         0,
                         phys_w,
                         phys_h,
-                        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
                     );
                 }
             }

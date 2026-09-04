@@ -24,6 +24,22 @@ pub enum ActiveMode {
     Pinned,
 }
 
+/// How exhausted quotas (100% used) are displayed.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExhaustedMode {
+    /// Hide progress bar, show compact single line with reset timer (default).
+    #[default]
+    #[serde(alias = "Compact")]
+    Compact,
+    /// Completely hide from list (timer moves to header badge), unless all are exhausted.
+    #[serde(alias = "Hidden")]
+    Hidden,
+    /// Classic display with full orange bar.
+    #[serde(alias = "Full")]
+    Full,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -45,6 +61,10 @@ pub struct Settings {
     pub family: Family,
     /// Verbose, anonymised logging next to the exe. Off unless asked for.
     pub diagnostics: bool,
+    /// How 100% exhausted quotas are shown.
+    pub exhausted_mode: ExhaustedMode,
+    /// Hide the strip when the active window is not an AI tool or supported editor.
+    pub auto_hide_on_inactive: bool,
 }
 
 impl Default for Settings {
@@ -61,6 +81,8 @@ impl Default for Settings {
             active_mode: ActiveMode::Auto,
             family: Family::Claude,
             diagnostics: false,
+            exhausted_mode: ExhaustedMode::Compact,
+            auto_hide_on_inactive: true,
         }
     }
 }
@@ -93,7 +115,7 @@ fn candidate_paths() -> Vec<PathBuf> {
 impl Settings {
     /// Resolved once: an existing file wins wherever it is, so load and save
     /// can never end up on different paths.
-    fn path() -> Option<PathBuf> {
+    pub fn path() -> Option<PathBuf> {
         static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
         PATH.get_or_init(|| {
             let candidates = candidate_paths();
@@ -104,6 +126,11 @@ impl Settings {
                 .or_else(|| candidates.into_iter().next())
         })
         .clone()
+    }
+
+    /// Directory containing settings.json (for diagnostics and Explorer).
+    pub fn dir() -> Option<PathBuf> {
+        Self::path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
     pub fn load() -> Self {

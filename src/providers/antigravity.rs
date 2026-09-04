@@ -443,9 +443,9 @@ fn build_snapshot(status: UserStatus) -> Snapshot {
         let (Some(label), Some(q)) = (cfg.label, cfg.quota_info) else {
             continue;
         };
-        let Some(remaining) = as_f64(q.remaining_fraction.as_ref()) else {
-            continue;
-        };
+        // In proto3 JSON, default float/double 0.0 is omitted during serialization.
+        // When quotaInfo is present, missing remainingFraction indicates 0.0 (exhausted / 100% used).
+        let remaining = as_f64(q.remaining_fraction.as_ref()).unwrap_or(0.0);
         let reset = as_time(q.reset_time.as_ref());
         let g = group_of(&label);
         let remaining = remaining.clamp(0.0, 1.0) as f32;

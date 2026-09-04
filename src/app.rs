@@ -10,7 +10,7 @@ use crate::update::{self, UpdateState};
 use chrono::{DateTime, Duration, Local, Utc};
 use eframe::egui;
 use egui::{Align2, Color32, FontId, PointerButton, Pos2, Rect, Sense, Vec2, ViewportCommand};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Latest fetch state of one family. `last` keeps the most recent *successful*
@@ -54,6 +54,14 @@ pub struct Shared {
     pub update_now: AtomicBool,
 }
 
+#[derive(Clone, Debug)]
+pub struct ResetTime {
+    #[allow(dead_code)]
+    pub abs: String,
+    pub row: String,
+    pub badge: String,
+}
+
 pub struct App {
     pub(crate) settings: Settings,
     pub(crate) shared: Arc<Shared>,
@@ -70,10 +78,12 @@ pub struct App {
     /// Family currently on screen.
     pub(crate) active: Family,
     detector: active::Detector,
+    is_ai_active: bool,
+    is_visible: bool,
     /// Height we last asked the OS for, so we only resize when it changes.
     applied_h: f32,
-    /// Cached "Resets …" strings, refreshed at most once per second.
-    reset_cache: Vec<Option<(String, String)>>,
+    /// Cached reset strings, refreshed at most once per second.
+    reset_cache: Vec<Option<ResetTime>>,
     reset_cache_sec: i64,
     /// Throttle for persisting the auto-switched family.
     last_family_save: f64,
@@ -124,6 +134,24 @@ fn force_topmost(hwnd: isize) {
 
 #[cfg(not(windows))]
 fn force_topmost(_hwnd: isize) {}
+
+pub(crate) static NATIVE_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Show or hide the native window without stealing focus.
+#[cfg(windows)]
+pub(crate) fn set_native_visible(hwnd: isize, visible: bool) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNA};
+    unsafe {
+        let _ = ShowWindow(
+            HWND(hwnd as *mut _),
+            if visible { SW_SHOWNA } else { SW_HIDE },
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn set_native_visible(_hwnd: isize, _visible: bool) {}
 
 // ---------------------------------------------------------------------------
 // Repaint backstop
@@ -222,6 +250,8 @@ impl App {
             wake.request_repaint();
         }));
 
+        active::spawn_watcher(cc.egui_ctx.clone());
+
         Self {
             active: settings.family,
             settings,
@@ -233,6 +263,8 @@ impl App {
             settings_h: 640.0,
             autostart,
             detector: active::Detector::default(),
+            is_ai_active: true,
+            is_visible: true,
             applied_h: 0.0,
             reset_cache: Vec::new(),
             reset_cache_sec: 0,
@@ -283,9 +315,12 @@ impl App {
     /// Follow the foreground window (or the pinned choice) and, on a switch,
     /// ask the poller to refresh that family right away.
     fn update_active(&mut self, t: f64) {
+        let active_status = self.detector.poll(t);
+        self.is_ai_active = active_status.is_ai;
+
         let target = match self.settings.active_mode {
             ActiveMode::Pinned => self.settings.family,
-            ActiveMode::Auto => match self.detector.poll(t) {
+            ActiveMode::Auto => match active_status.family {
                 Some(f) if self.settings.enabled(f) => f,
                 _ => self.active,
             },
@@ -312,10 +347,11 @@ impl App {
         let full = ui.max_rect();
         let painter = ui.painter().clone();
 
-        // Translucent rounded background (no stroke — a coloured outline reads as
-        // a stray fringe on the transparent window corners).
+        // Translucent rounded background drawn exactly to applied_h (anchored at top).
+        let bg_h = if self.applied_h > 0.0 { self.applied_h } else { full.height() };
+        let strip_rect = Rect::from_min_size(full.min, Vec2::new(full.width(), bg_h));
         painter.rect_filled(
-            full,
+            strip_rect,
             egui::Rounding::same(8.0),
             Color32::from_rgba_unmultiplied(22, 24, 30, (op * 235.0) as u8),
         );
@@ -339,7 +375,53 @@ impl App {
         // Both states draw real numbers; only the status word differs.
         let show_values = online || stale;
 
-        // Header: environment/plan (left) + online/offline status (right).
+        // Partition limits into active and exhausted
+        let all_limits = last.as_ref().map(|s| s.limits.as_slice()).unwrap_or(&[]);
+        let (active_indices, exhausted_indices): (Vec<usize>, Vec<usize>) = (0..all_limits.len())
+            .partition(|&i| all_limits[i].used_percent < LIMIT_PCT);
+
+        let (visible_indices, hidden_exhausted): (Vec<usize>, Vec<usize>) = match self.settings.exhausted_mode {
+            crate::config::ExhaustedMode::Full | crate::config::ExhaustedMode::Compact => {
+                ((0..all_limits.len()).collect(), Vec::new())
+            }
+            crate::config::ExhaustedMode::Hidden => {
+                if active_indices.is_empty() {
+                    // All exhausted: keep showing so the window is never empty
+                    ((0..all_limits.len()).collect(), Vec::new())
+                } else {
+                    (active_indices, exhausted_indices)
+                }
+            }
+        };
+
+        // Cache reset times
+        let sec = now.timestamp();
+        if self.reset_cache_sec != sec || self.reset_cache.len() != all_limits.len() {
+            self.reset_cache = all_limits
+                .iter()
+                .map(|l| l.window.map(|w| fmt_reset(w.resets_at, now)))
+                .collect();
+            self.reset_cache_sec = sec;
+        }
+
+        // Check if there is an exhausted limit hidden from the list that needs a header badge
+        let hidden_badge = if !hidden_exhausted.is_empty() {
+            hidden_exhausted
+                .iter()
+                .filter_map(|&i| {
+                    let lim = &all_limits[i];
+                    let reset_time = self.reset_cache.get(i).and_then(|r| r.as_ref())?;
+                    let name = lim.title.split_whitespace().next().unwrap_or(&lim.title).to_string();
+                    let resets_at = lim.window?.resets_at;
+                    Some((name, reset_time.badge.clone(), resets_at))
+                })
+                .min_by_key(|(_, _, t)| *t)
+                .map(|(name, badge, _)| (name, badge))
+        } else {
+            None
+        };
+
+        // Header: environment/plan (left) + optional hidden badge + online/offline status (right).
         let header = match self.settings.header_mode {
             HeaderMode::Hidden => String::new(),
             HeaderMode::FamilyOnly => self.active.name().to_string(),
@@ -400,23 +482,48 @@ impl App {
                 col,
             );
         }
+
+        // Draw hidden quota reset badge in header next to network status
+        if let Some((h_name, h_badge)) = hidden_badge {
+            let badge_font = FontId::proportional(10.0);
+            let prefix = format!("{h_name} сброс: ");
+            let prefix_g = painter.layout_no_wrap(prefix, badge_font.clone(), dim);
+            let badge_g = painter.layout_no_wrap(
+                h_badge,
+                badge_font,
+                Color32::from_rgba_unmultiplied(214, 150, 74, text_a),
+            );
+            let pill_pad = 5.0;
+            let prefix_w = prefix_g.size().x;
+            let pill_w = prefix_w + badge_g.size().x + pill_pad * 2.0;
+            let pill_h = 16.0;
+            let status_left = if dot { status_rect.left() - 12.0 } else { status_rect.left() - 4.0 };
+            let pill_right = status_left - 6.0;
+            let pill_left = pill_right - pill_w;
+            let pill_rect = Rect::from_min_size(Pos2::new(pill_left, y - 1.0), Vec2::new(pill_w, pill_h));
+
+            painter.rect_filled(
+                pill_rect,
+                egui::Rounding::same(4.0),
+                Color32::from_rgba_unmultiplied(214, 150, 74, (0.18 * 255.0) as u8),
+            );
+            painter.galley(Pos2::new(pill_left + pill_pad, y + 1.0), prefix_g, dim);
+            painter.galley(
+                Pos2::new(pill_left + pill_pad + prefix_w, y + 1.0),
+                badge_g,
+                Color32::from_rgba_unmultiplied(214, 150, 74, text_a),
+            );
+        }
+
         y += 17.0;
 
-        if let Some(s) = &last {
-            // Reset-time strings change at most once a second — cache them so
-            // we don't reformat on every animation frame.
-            let sec = now.timestamp();
-            if self.reset_cache_sec != sec || self.reset_cache.len() != s.limits.len() {
-                self.reset_cache = s
-                    .limits
-                    .iter()
-                    .map(|l| l.window.map(|w| fmt_reset(w.resets_at, now)))
-                    .collect();
-                self.reset_cache_sec = sec;
-            }
-            for (i, lim) in s.limits.iter().enumerate() {
-                let reset = self.reset_cache[i].as_ref();
-                draw_limit(
+        if show_values && !visible_indices.is_empty() {
+            for &i in &visible_indices {
+                let lim = &all_limits[i];
+                let reset = self.reset_cache.get(i).and_then(|r| r.as_ref());
+                let is_compact = lim.used_percent >= LIMIT_PCT
+                    && self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact;
+                let row_h = draw_limit(
                     &painter,
                     lim,
                     reset,
@@ -432,8 +539,9 @@ impl App {
                     animate,
                     anim_t,
                     i,
+                    is_compact,
                 );
-                y += 34.0;
+                y += row_h;
             }
         } else if !online && ever {
             painter.text(
@@ -451,6 +559,14 @@ impl App {
                 format!("ошибка: {e}"),
                 FontId::proportional(10.5),
                 Color32::from_rgba_unmultiplied(232, 150, 80, text_a),
+            );
+        } else {
+            painter.text(
+                Pos2::new(left, y),
+                Align2::LEFT_TOP,
+                "загрузка данных…",
+                FontId::proportional(11.0),
+                dim,
             );
         }
     }
@@ -583,7 +699,7 @@ fn spawn_update_checker(shared: Arc<Shared>, ctx: egui::Context) {
 fn draw_limit(
     painter: &egui::Painter,
     lim: &providers::Limit,
-    reset: Option<&(String, String)>,
+    reset: Option<&ResetTime>,
     left: f32,
     right: f32,
     y: f32,
@@ -596,158 +712,147 @@ fn draw_limit(
     animate: bool,
     anim_t: f64,
     idx: usize,
-) {
-    {
-        // No window at all (the service has not opened one) → no clock: no time
-        // marker, no pace colours, no bubbles. A window whose start we could not
-        // place stands at its very beginning instead (D10, `marker_frac`).
-        let time_frac = lim.window.map(|w| w.marker_frac(now));
-        let use_frac = (lim.used_percent / 100.0).clamp(0.0, 1.0);
-        // Quota fully gone (100%) → whole bar orange. Spending faster than time
-        // (but < 100%) → "overspend": freeze bubbles, paint the part past the
-        // time marker dim-yellow.
-        // A window can run out between two polls: what we hold is still the
-        // last truth about it, and the next poll (a minute away) brings the new
-        // one. Keep showing it for a grace period; only a long silence — a
-        // throttle that outlives the window — makes the number meaningless.
-        let past_reset = lim.window.map(|w| now - w.resets_at);
-        let show = show_values && past_reset.map_or(true, |d| d < RESET_GRACE);
-        let exhausted = lim.used_percent >= LIMIT_PCT;
-        let overspend = show && !exhausted && time_frac.is_some_and(|t| use_frac > t + 0.02);
+    is_compact: bool,
+) -> f32 {
+    let time_frac = lim.window.map(|w| w.marker_frac(now));
+    let use_frac = (lim.used_percent / 100.0).clamp(0.0, 1.0);
+    let past_reset = lim.window.map(|w| now - w.resets_at);
+    let show = show_values && past_reset.map_or(true, |d| d < RESET_GRACE);
+    let exhausted = lim.used_percent >= LIMIT_PCT;
+    let overspend = show && !exhausted && time_frac.is_some_and(|t| use_frac > t + 0.02);
 
-        // Title line: name (left) + reset time (far right) + used% (left of it).
-        painter.text(
-            Pos2::new(left, y),
-            Align2::LEFT_TOP,
-            &lim.title,
-            FontId::proportional(12.5),
-            strong,
-        );
-        let reset_text = match reset {
-            Some((abs, rel)) => format!("Resets {abs} · {rel}"),
-            None => "окно ещё не начато".to_string(),
-        };
-        let reset_rect = painter.text(
-            Pos2::new(right, y + 1.0),
-            Align2::RIGHT_TOP,
-            reset_text,
-            FontId::proportional(11.0),
-            dim,
-        );
-        let pct_text = if show {
-            format!("{:.0}%", lim.used_percent)
-        } else {
-            "—".to_string()
-        };
-        let pct_col = if !show {
-            Color32::from_rgba_unmultiplied(150, 155, 165, text_a)
-        } else {
-            spend_text_color(exhausted, overspend, text_a)
-        };
-        painter.text(
-            Pos2::new(reset_rect.left() - 12.0, y),
-            Align2::RIGHT_TOP,
-            pct_text,
-            FontId::proportional(12.5),
-            pct_col,
-        );
+    // Title line: name (left) + reset time (far right) + used% (left of it).
+    // In compact mode, the name is dimmed as requested in requirements.
+    let title_col = if is_compact { dim } else { strong };
+    painter.text(
+        Pos2::new(left, y),
+        Align2::LEFT_TOP,
+        &lim.title,
+        FontId::proportional(12.5),
+        title_col,
+    );
+    let reset_text = match reset {
+        Some(r) => r.row.clone(),
+        None => "окно ещё не начато".to_string(),
+    };
+    let reset_rect = painter.text(
+        Pos2::new(right, y + 1.0),
+        Align2::RIGHT_TOP,
+        reset_text,
+        FontId::proportional(11.0),
+        dim,
+    );
+    let pct_text = if show {
+        format!("{:.0}%", lim.used_percent)
+    } else {
+        "—".to_string()
+    };
+    let pct_col = if !show {
+        Color32::from_rgba_unmultiplied(150, 155, 165, text_a)
+    } else {
+        spend_text_color(exhausted, overspend, text_a)
+    };
+    painter.text(
+        Pos2::new(reset_rect.left() - 12.0, y),
+        Align2::RIGHT_TOP,
+        pct_text,
+        FontId::proportional(12.5),
+        pct_col,
+    );
 
-        // Single usage bar.
-        let track_col = Color32::from_rgba_unmultiplied(60, 64, 76, (op * 220.0) as u8);
-        let full_w = right - left;
-        let ub_y = y + 18.0;
-        let ub_h = 11.0;
-        let yc = ub_y + ub_h / 2.0;
-        let ub_track = Rect::from_min_max(Pos2::new(left, ub_y), Pos2::new(right, ub_y + ub_h));
-        painter.rect_filled(ub_track, egui::Rounding::same(4.0), track_col);
-
-        // Where the time marker sits — nowhere, when the window has no clock.
-        let marker_x = time_frac.map(|t| left + full_w * t);
-
-        let green =
-            Color32::from_rgba_unmultiplied(96, 196, 132, ((0.55 + 0.45 * op) * 255.0) as u8);
-        let yellow =
-            Color32::from_rgba_unmultiplied(208, 192, 96, ((0.55 + 0.45 * op) * 255.0) as u8);
-        let orange =
-            Color32::from_rgba_unmultiplied(214, 150, 74, ((0.55 + 0.45 * op) * 255.0) as u8);
-
-        if show {
-            let use_end = left + full_w * use_frac;
-            if exhausted {
-                // Quota gone → the whole bar is dim-orange.
-                painter.rect_filled(ub_track, egui::Rounding::same(4.0), orange);
-            } else if let Some(mx) = marker_x.filter(|_| overspend) {
-                // Green up to the time marker, dim-yellow for the overspend
-                // (marker → spend edge). No bubbles.
-                painter.rect_filled(
-                    Rect::from_min_max(ub_track.min, Pos2::new(mx, ub_y + ub_h)),
-                    egui::Rounding::same(4.0),
-                    green,
-                );
-                painter.rect_filled(
-                    Rect::from_min_max(Pos2::new(mx, ub_y), Pos2::new(use_end, ub_y + ub_h)),
-                    egui::Rounding::same(4.0),
-                    yellow,
-                );
-            } else {
-                // Under pace: green fill up to spend edge, with bubbles rising
-                // out of the spend edge and dissolving just to its right.
-                let ub_fill_w = (use_end - left).max(if use_frac > 0.0 { 3.0 } else { 0.0 });
-                painter.rect_filled(
-                    Rect::from_min_size(ub_track.min, Vec2::new(ub_fill_w, ub_h)),
-                    egui::Rounding::same(4.0),
-                    green,
-                );
-                if let Some(mx) = marker_x.filter(|mx| animate && *mx > use_end + 4.0) {
-                    draw_bubbles_headroom(
-                        painter,
-                        use_end,
-                        mx,
-                        0.33 * full_w, // dissolve within ≤33% of the bar
-                        ub_y,
-                        ub_h,
-                        anim_t,
-                        (150, 224, 176),
-                        op,
-                        idx as f64 * 1.7,
-                    );
-                }
-            }
-        } else if animate {
-            // Offline: spend unknown → grey "flow" across the whole bar.
-            draw_bubbles(
-                painter,
-                left + 2.0,
-                right - 2.0,
-                yc,
-                anim_t,
-                (170, 175, 186),
-                op,
-                idx as f64 * 0.41,
-                6,
-                0.5,
-            );
-        } else {
-            // Offline, animation off → a static grey placeholder fill.
-            painter.rect_filled(
-                Rect::from_min_max(Pos2::new(left, ub_y), Pos2::new(right, ub_y + ub_h)),
-                egui::Rounding::same(4.0),
-                Color32::from_rgba_unmultiplied(96, 100, 110, (op * 200.0) as u8),
-            );
-        }
-
-        // Vertical marker = current time position, when there is a clock.
-        if let Some(mx) = marker_x {
-            painter.rect_filled(
-                Rect::from_min_max(
-                    Pos2::new(mx - 1.0, ub_y - 2.0),
-                    Pos2::new(mx + 1.0, ub_y + ub_h + 2.0),
-                ),
-                egui::Rounding::same(1.0),
-                Color32::from_rgba_unmultiplied(235, 238, 245, ((0.55 + 0.45 * op) * 255.0) as u8),
-            );
-        }
+    if is_compact {
+        return 18.0;
     }
+
+    // Single usage bar.
+    let track_col = Color32::from_rgba_unmultiplied(60, 64, 76, (op * 220.0) as u8);
+    let full_w = right - left;
+    let ub_y = y + 18.0;
+    let ub_h = 11.0;
+    let yc = ub_y + ub_h / 2.0;
+    let ub_track = Rect::from_min_max(Pos2::new(left, ub_y), Pos2::new(right, ub_y + ub_h));
+    painter.rect_filled(ub_track, egui::Rounding::same(4.0), track_col);
+
+    // Where the time marker sits — nowhere, when the window has no clock.
+    let marker_x = time_frac.map(|t| left + full_w * t);
+
+    let green =
+        Color32::from_rgba_unmultiplied(96, 196, 132, ((0.55 + 0.45 * op) * 255.0) as u8);
+    let yellow =
+        Color32::from_rgba_unmultiplied(208, 192, 96, ((0.55 + 0.45 * op) * 255.0) as u8);
+    let orange =
+        Color32::from_rgba_unmultiplied(214, 150, 74, ((0.55 + 0.45 * op) * 255.0) as u8);
+
+    if show {
+        let use_end = left + full_w * use_frac;
+        if exhausted {
+            painter.rect_filled(ub_track, egui::Rounding::same(4.0), orange);
+        } else if let Some(mx) = marker_x.filter(|_| overspend) {
+            painter.rect_filled(
+                Rect::from_min_max(ub_track.min, Pos2::new(mx, ub_y + ub_h)),
+                egui::Rounding::same(4.0),
+                green,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(mx, ub_y), Pos2::new(use_end, ub_y + ub_h)),
+                egui::Rounding::same(4.0),
+                yellow,
+            );
+        } else {
+            let ub_fill_w = (use_end - left).max(if use_frac > 0.0 { 3.0 } else { 0.0 });
+            painter.rect_filled(
+                Rect::from_min_size(ub_track.min, Vec2::new(ub_fill_w, ub_h)),
+                egui::Rounding::same(4.0),
+                green,
+            );
+            if let Some(mx) = marker_x.filter(|mx| animate && *mx > use_end + 4.0) {
+                draw_bubbles_headroom(
+                    painter,
+                    use_end,
+                    mx,
+                    0.33 * full_w,
+                    ub_y,
+                    ub_h,
+                    anim_t,
+                    (150, 224, 176),
+                    op,
+                    idx as f64 * 1.7,
+                );
+            }
+        }
+    } else if animate {
+        draw_bubbles(
+            painter,
+            left + 2.0,
+            right - 2.0,
+            yc,
+            anim_t,
+            (170, 175, 186),
+            op,
+            idx as f64 * 0.41,
+            6,
+            0.5,
+        );
+    } else {
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(left, ub_y), Pos2::new(right, ub_y + ub_h)),
+            egui::Rounding::same(4.0),
+            Color32::from_rgba_unmultiplied(96, 100, 110, (op * 200.0) as u8),
+        );
+    }
+
+    if let Some(mx) = marker_x {
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(mx - 1.0, ub_y - 2.0),
+                Pos2::new(mx + 1.0, ub_y + ub_h + 2.0),
+            ),
+            egui::Rounding::same(1.0),
+            Color32::from_rgba_unmultiplied(235, 238, 245, ((0.55 + 0.45 * op) * 255.0) as u8),
+        );
+    }
+
+    34.0
 }
 
 /// How long a limit keeps showing its last percentage after its window was due
@@ -863,31 +968,46 @@ fn draw_bubbles(
     }
 }
 
-fn fmt_reset(reset: DateTime<Utc>, now: DateTime<Utc>) -> (String, String) {
+
+fn fmt_reset(reset: DateTime<Utc>, now: DateTime<Utc>) -> ResetTime {
     let local = reset.with_timezone(&Local);
-    let rem = reset - now;
-    let abs = if rem > Duration::hours(24) {
-        local.format("%a %H:%M").to_string()
+    let abs = local.format("%H:%M").to_string();
+    let diff_secs = (reset - now).num_seconds();
+
+    if diff_secs <= 0 {
+        return ResetTime {
+            abs: abs.clone(),
+            row: format!("Сброс {abs} · сейчас"),
+            badge: format!("{abs} (сейчас)"),
+        };
+    }
+
+    let mins = diff_secs / 60;
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+
+    let (rel_row, rel_badge) = if days > 0 {
+        (
+            format!("через {days}д {rem_hours}ч"),
+            format!("{days}д {rem_hours}ч"),
+        )
+    } else if hours > 0 {
+        (
+            format!("через {hours}ч {rem_mins}м"),
+            format!("{hours}ч {rem_mins}м"),
+        )
     } else {
-        local.format("%H:%M").to_string()
+        let m = mins.max(1);
+        (format!("через {m}м"), format!("{m}м"))
     };
-    let mins = rem.num_minutes().max(0);
-    let rel = if mins >= 1440 {
-        format!("{}d {}h", mins / 1440, (mins % 1440) / 60)
-    } else if mins >= 60 {
-        format!("{}h {}m", mins / 60, mins % 60)
-    } else if rem > Duration::zero() {
-        // "0m" read as "already reset" while the quota was still counting.
-        if mins == 0 {
-            "<1m".to_string()
-        } else {
-            format!("{mins}m")
-        }
-    } else {
-        // The clock ran out; the next poll brings the new window.
-        "обновление…".to_string()
-    };
-    (abs, rel)
+
+    ResetTime {
+        abs: abs.clone(),
+        row: format!("Сброс {abs} · {rel_row}"),
+        badge: format!("{abs} ({rel_badge})"),
+    }
 }
 
 impl eframe::App for App {
@@ -897,59 +1017,132 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         LAST_PAINT_MS.store(uptime_ms(), Ordering::Relaxed);
+        if self.hwnd.is_none() {
+            self.hwnd = native_hwnd(frame);
+            if let Some(h) = self.hwnd {
+                NATIVE_HWND.store(h, Ordering::Relaxed);
+            }
+        }
         self.handle_tray_events(ctx);
 
         let anim_t = ctx.input(|i| i.time);
         self.update_active(anim_t);
 
-        // Snapshot animation-relevant state under one lock.
+        // Smart Focus: auto-hide when foreground app is not an AI tool or editor.
+        // Keep visible for the first 10 seconds after launch so the user sees Quotty start.
+        let in_grace_period = anim_t < 10.0;
+        let should_show = if self.show_settings || in_grace_period {
+            true
+        } else if self.settings.auto_hide_on_inactive {
+            self.is_ai_active
+        } else {
+            true
+        };
+
+        if should_show != self.is_visible {
+            self.is_visible = should_show;
+            if let Some(h) = self.hwnd {
+                set_native_visible(h, should_show);
+            }
+        }
+
+        // Snapshot animation-relevant state under one lock and calculate pixel-perfect height.
         let animate_on = self.settings.animate;
-        let (n_limits, animating) = {
+        let (want_h, animating) = {
             let st = self.shared.states.lock().unwrap();
             let s = &st[self.active.idx()];
-            let n = s.last.as_ref().map(|s| s.limits.len().max(1)).unwrap_or(2);
-            // Animate (when enabled) whenever offline, or online with a gap.
-            let stale = !s.online && s.rate_limited && s.last.is_some();
-            let anim = if stale {
-                true
-            } else if !animate_on {
-                false
-            } else if !s.online {
-                true
-            } else if let Some(snap) = &s.last {
+            let last = s.last.as_ref().filter(|snap| snap.family == self.active);
+            let show_values = s.online || (s.rate_limited && last.is_some());
+            let header_h = 17.0;
+            let pad_h = 18.0; // 8.0 top + 10.0 bottom
+
+            let (h, anim) = if let (true, Some(snap)) = (show_values, last) {
+                let all_limits = &snap.limits;
+                let active_limits: Vec<_> = all_limits.iter().filter(|l| l.used_percent < LIMIT_PCT).collect();
+                let visible_limits: Vec<&providers::Limit> = match self.settings.exhausted_mode {
+                    crate::config::ExhaustedMode::Full | crate::config::ExhaustedMode::Compact => {
+                        all_limits.iter().collect()
+                    }
+                    crate::config::ExhaustedMode::Hidden => {
+                        if active_limits.is_empty() {
+                            all_limits.iter().collect()
+                        } else {
+                            active_limits
+                        }
+                    }
+                };
+
+                let mut rows_h = 0.0f32;
+                for lim in &visible_limits {
+                    let is_compact = lim.used_percent >= LIMIT_PCT
+                        && self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact;
+                    rows_h += if is_compact { 18.0 } else { 34.0 };
+                }
+
                 let now = Utc::now();
-                snap.limits.iter().any(|l| {
-                    // Same clock as `draw_limit`: an unplaceable start reads as
-                    // "at the beginning", which is never ahead of the spend.
+                let has_gap = snap.limits.iter().any(|l| {
                     let Some(time_frac) = l.window.map(|w| w.marker_frac(now)) else {
                         return false;
                     };
                     let use_frac = (l.used_percent / 100.0).clamp(0.0, 1.0);
                     time_frac > use_frac + 0.02
-                })
+                });
+                let stale = !s.online && s.rate_limited;
+                let is_animating = if stale {
+                    true
+                } else if !animate_on {
+                    false
+                } else if !s.online {
+                    true
+                } else {
+                    has_gap
+                };
+
+                (pad_h + header_h + rows_h, is_animating)
             } else {
-                false
+                let stale = !s.online && s.rate_limited && s.last.is_some();
+                let is_animating = if stale {
+                    true
+                } else if !animate_on {
+                    false
+                } else {
+                    !s.online
+                };
+                (pad_h + header_h + 18.0, is_animating)
             };
-            (n, anim)
+
+            (h, anim)
         };
 
-        // Fit the window height to the number of limits — which changes when the
-        // active family does (Claude has two windows, Antigravity three).
-        let want_h = 8.0 + 17.0 + n_limits as f32 * 34.0 + 6.0;
+        // Fit the window height dynamically to visible content (top edge anchored).
         if (want_h - self.applied_h).abs() > 0.5 {
+            #[cfg(windows)]
+            if let Some(h) = self.hwnd {
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+                };
+                let ppp = ctx.pixels_per_point();
+                let phys_w = (430.0 * ppp).round() as i32;
+                let phys_h = (want_h * ppp).round() as i32;
+                unsafe {
+                    let _ = SetWindowPos(
+                        HWND(h as *mut _),
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        phys_w,
+                        phys_h,
+                        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                    );
+                }
+            }
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(430.0, want_h)));
             self.applied_h = want_h;
         }
 
-        // Re-assert always-on-top periodically: the taskbar is topmost too and
-        // whichever topmost window was raised last wins. NOTE: going through
-        // egui/winit (`ViewportCommand::WindowLevel`) does NOT work — winit
-        // diffs window flags and returns early when the level is unchanged, so
-        // no SetWindowPos is issued. We must call Win32 directly.
+        // Re-assert always-on-top periodically
         if anim_t - self.last_topmost >= 0.7 {
-            if self.hwnd.is_none() {
-                self.hwnd = native_hwnd(frame);
-            }
             if let Some(h) = self.hwnd {
                 force_topmost(h);
             }
@@ -971,9 +1164,7 @@ impl eframe::App for App {
                 self.draw_strip(ui, anim_t, animate_on);
             });
 
-        // Persist the window position when the user finishes moving it — and
-        // only then. Saving on any release once let the placement the shell
-        // imposes on a shortcut launch overwrite the user's own position.
+        // Persist the window position when the user finishes moving it
         if self.dragging && ctx.input(|i| i.pointer.any_released()) {
             self.dragging = false;
             if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
@@ -988,10 +1179,6 @@ impl eframe::App for App {
         self.sync_tooltip();
         self.render_settings(ctx);
 
-        // Animate at ~20 FPS only when there's motion to show; otherwise idle at
-        // 2 FPS to keep timers/labels flowing without burning CPU. Tray menu
-        // events wake the loop on their own (see the handler in `new`), and the
-        // Win32 timer covers the stretches where winit's own wake-up can't run.
         let period = if animating { 50 } else { 500 };
         if let Some(h) = self.hwnd {
             if self.timer_period != period {
@@ -1008,18 +1195,28 @@ mod tests {
     use super::fmt_reset;
     use chrono::{Duration, Utc};
 
-    /// The window is still counting until its reset actually passes: rounding
-    /// the last seconds down to "0m" read as "already reset".
     #[test]
-    fn the_last_minute_is_not_zero_minutes() {
+    fn reset_timer_formatting() {
         let now = Utc::now();
-        let rel = |secs: i64| fmt_reset(now + Duration::seconds(secs), now).1;
+        let rel_row = |secs: i64| fmt_reset(now + Duration::seconds(secs), now).row;
+        let rel_badge = |secs: i64| fmt_reset(now + Duration::seconds(secs), now).badge;
 
-        assert_eq!(rel(40), "<1m", "under a minute still has time left");
-        assert_eq!(rel(95), "1m");
-        assert_eq!(rel(2 * 3600 + 5 * 60), "2h 5m");
-        assert_eq!(rel(25 * 3600), "1d 1h");
-        assert_eq!(rel(0), "обновление…", "the clock ran out, wait for a poll");
-        assert_eq!(rel(-30), "обновление…");
+        assert!(rel_row(40).ends_with("через 1м"));
+        assert!(rel_badge(40).ends_with("(1м)"));
+
+        assert!(rel_row(95).ends_with("через 1м"));
+        assert!(rel_badge(95).ends_with("(1м)"));
+
+        assert!(rel_row(2 * 3600 + 45 * 60).ends_with("через 2ч 45м"));
+        assert!(rel_badge(2 * 3600 + 45 * 60).ends_with("(2ч 45м)"));
+
+        assert!(rel_row(25 * 3600).ends_with("через 1д 1ч"));
+        assert!(rel_badge(25 * 3600).ends_with("(1д 1ч)"));
+
+        assert!(rel_row(0).ends_with("сейчас"));
+        assert!(rel_badge(0).ends_with("(сейчас)"));
+
+        assert!(rel_row(-30).ends_with("сейчас"));
+        assert!(rel_badge(-30).ends_with("(сейчас)"));
     }
 }

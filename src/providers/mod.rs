@@ -53,6 +53,8 @@ pub struct Limit {
     /// on screen: the limit exists and stands at 0 %, there is just no clock to
     /// draw against.
     pub window: Option<LimitWindow>,
+    /// Optional badge rendered next to model title (e.g. "нед. 71%").
+    pub badge: Option<String>,
 }
 
 /// The stretch of time a limit is measured over.

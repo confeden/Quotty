@@ -65,6 +65,10 @@ pub struct Settings {
     pub exhausted_mode: ExhaustedMode,
     /// Hide the strip when the active window is not an AI tool or supported editor.
     pub auto_hide_on_inactive: bool,
+    /// Show weekly limit badge next to model title.
+    pub show_weekly_limits: bool,
+    /// Global compact mode: hide progress bars, showing only text and reset timers.
+    pub compact_mode: bool,
 }
 
 impl Default for Settings {
@@ -83,6 +87,8 @@ impl Default for Settings {
             diagnostics: false,
             exhausted_mode: ExhaustedMode::Compact,
             auto_hide_on_inactive: true,
+            show_weekly_limits: true,
+            compact_mode: false,
         }
     }
 }

@@ -183,6 +183,7 @@ fn to_limit(w: Window, now: DateTime<Utc>) -> Option<Limit> {
         title: window_title(span.num_seconds()),
         used_percent: used,
         window: Some(LimitWindow::ending_at(resets_at, span, now)),
+        badge: None,
     })
 }
 

@@ -153,6 +153,51 @@ pub(crate) fn set_native_visible(hwnd: isize, visible: bool) {
 #[cfg(not(windows))]
 pub(crate) fn set_native_visible(_hwnd: isize, _visible: bool) {}
 
+#[cfg(windows)]
+fn show_context_menu(hwnd: isize, compact_mode: bool) -> Option<usize> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow,
+        TrackPopupMenu, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
+    };
+
+    unsafe {
+        let hmenu = CreatePopupMenu().ok()?;
+        let compact_text = if compact_mode {
+            "Обычный режим (с полосами)"
+        } else {
+            "Компактный режим (без полос)"
+        };
+        let _ = AppendMenuW(hmenu, MF_STRING, 1, &HSTRING::from(compact_text));
+        let _ = AppendMenuW(hmenu, MF_STRING, 2, &HSTRING::from("Настройки…"));
+
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(HWND(hwnd as *mut _));
+        let cmd = TrackPopupMenu(
+            hmenu,
+            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+            pt.x,
+            pt.y,
+            0,
+            HWND(hwnd as *mut _),
+            None,
+        );
+        let _ = DestroyMenu(hmenu);
+        if cmd.0 > 0 {
+            Some(cmd.0 as usize)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn show_context_menu(_hwnd: isize, _compact_mode: bool) -> Option<usize> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Repaint backstop
 //
@@ -391,9 +436,10 @@ impl App {
         if show_values && !visible_indices.is_empty() {
             for &i in &visible_indices {
                 let lim = &all_limits[i];
-                let is_compact = lim.used_percent >= LIMIT_PCT
-                    && (self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact
-                        || (self.settings.exhausted_mode == crate::config::ExhaustedMode::Hidden && all_exhausted));
+                let is_compact = self.settings.compact_mode
+                    || (lim.used_percent >= LIMIT_PCT
+                        && (self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact
+                            || (self.settings.exhausted_mode == crate::config::ExhaustedMode::Hidden && all_exhausted)));
                 rows_h += if is_compact { 18.0 } else { 34.0 };
             }
         } else {
@@ -535,9 +581,10 @@ impl App {
             for &i in &visible_indices {
                 let lim = &all_limits[i];
                 let reset = self.reset_cache.get(i).and_then(|r| r.as_ref());
-                let is_compact = lim.used_percent >= LIMIT_PCT
-                    && (self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact
-                        || (self.settings.exhausted_mode == crate::config::ExhaustedMode::Hidden && all_exhausted));
+                let is_compact = self.settings.compact_mode
+                    || (lim.used_percent >= LIMIT_PCT
+                        && (self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact
+                            || (self.settings.exhausted_mode == crate::config::ExhaustedMode::Hidden && all_exhausted)));
                 let row_h = draw_limit(
                     &painter,
                     lim,
@@ -555,6 +602,7 @@ impl App {
                     anim_t,
                     i,
                     is_compact,
+                    self.settings.show_weekly_limits,
                 );
                 y += row_h;
             }
@@ -728,6 +776,7 @@ fn draw_limit(
     anim_t: f64,
     idx: usize,
     is_compact: bool,
+    show_weekly_limits: bool,
 ) -> f32 {
     let time_frac = lim.window.map(|w| w.marker_frac(now));
     let use_frac = (lim.used_percent / 100.0).clamp(0.0, 1.0);
@@ -736,16 +785,42 @@ fn draw_limit(
     let exhausted = lim.used_percent >= LIMIT_PCT;
     let overspend = show && !exhausted && time_frac.is_some_and(|t| use_frac > t + 0.02);
 
-    // Title line: name (left) + reset time (far right) + used% (left of it).
-    // In compact mode, the name is dimmed as requested in requirements.
-    let title_col = if is_compact { dim } else { strong };
-    painter.text(
+    // Title line: name (left) + optional weekly badge + reset time (far right) + used% (left of it).
+    // In compact mode, active models stay strong/bright; only exhausted models are dimmed.
+    let title_col = if exhausted { dim } else { strong };
+    let title_rect = painter.text(
         Pos2::new(left, y),
         Align2::LEFT_TOP,
         &lim.title,
         FontId::proportional(12.5),
         title_col,
     );
+
+    if show_weekly_limits {
+        if let Some(badge_str) = &lim.badge {
+            let badge_font = FontId::proportional(10.0);
+            let badge_color = Color32::from_rgba_unmultiplied(214, 150, 74, text_a);
+            let badge_g = painter.layout_no_wrap(badge_str.clone(), badge_font, badge_color);
+            let h_pad = 4.0;
+            let v_pad = 1.5;
+            let b_w = badge_g.size().x + h_pad * 2.0;
+            let b_h = badge_g.size().y + v_pad * 2.0;
+            let b_left = title_rect.right() + 5.0;
+            let b_top = y + (title_rect.height() - b_h) / 2.0;
+            let b_rect = Rect::from_min_size(Pos2::new(b_left, b_top), Vec2::new(b_w, b_h));
+
+            painter.rect_filled(
+                b_rect,
+                egui::Rounding::same(3.5),
+                Color32::from_rgba_unmultiplied(214, 150, 74, (0.15 * 255.0) as u8),
+            );
+            painter.galley(
+                Pos2::new(b_left + h_pad, b_top + v_pad),
+                badge_g,
+                badge_color,
+            );
+        }
+    }
     let reset_text = match reset {
         Some(r) => r.row.clone(),
         None => "окно ещё не начато".to_string(),
@@ -1090,9 +1165,10 @@ impl eframe::App for App {
 
                 let mut rows_h = 0.0f32;
                 for lim in &visible_limits {
-                    let is_compact = lim.used_percent >= LIMIT_PCT
-                        && (self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact
-                            || (self.settings.exhausted_mode == crate::config::ExhaustedMode::Hidden && all_exhausted));
+                    let is_compact = self.settings.compact_mode
+                        || (lim.used_percent >= LIMIT_PCT
+                            && (self.settings.exhausted_mode == crate::config::ExhaustedMode::Compact
+                                || (self.settings.exhausted_mode == crate::config::ExhaustedMode::Hidden && all_exhausted)));
                     rows_h += if is_compact { 18.0 } else { 34.0 };
                 }
 
@@ -1176,7 +1252,29 @@ impl eframe::App for App {
                     self.dragging = true;
                 }
                 if resp.clicked_by(PointerButton::Secondary) {
-                    self.open_settings(true);
+                    #[cfg(windows)]
+                    {
+                        if let Some(h) = self.hwnd {
+                            if let Some(cmd) = show_context_menu(h, self.settings.compact_mode) {
+                                match cmd {
+                                    1 => {
+                                        self.settings.compact_mode = !self.settings.compact_mode;
+                                        self.settings.save();
+                                    }
+                                    2 => {
+                                        self.open_settings(true);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            self.open_settings(true);
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        self.open_settings(true);
+                    }
                 }
                 self.draw_strip(ui, anim_t, animate_on);
             });

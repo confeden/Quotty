@@ -432,6 +432,7 @@ impl App {
                     animate,
                     anim_t,
                     i,
+                    self.settings.show_weekly_limits,
                 );
                 y += 34.0;
             }
@@ -596,6 +597,7 @@ fn draw_limit(
     animate: bool,
     anim_t: f64,
     idx: usize,
+    show_weekly_limits: bool,
 ) {
     {
         // No window at all (the service has not opened one) → no clock: no time
@@ -616,15 +618,51 @@ fn draw_limit(
         let overspend = show && !exhausted && time_frac.is_some_and(|t| use_frac > t + 0.02);
 
         // Title line: name (left) + reset time (far right) + used% (left of it).
-        painter.text(
+        let title_rect = painter.text(
             Pos2::new(left, y),
             Align2::LEFT_TOP,
             &lim.title,
             FontId::proportional(12.5),
             strong,
         );
+        if lim.weekly_exhausted() && show {
+            painter.text(
+                Pos2::new(title_rect.right() + 5.0, y + 1.0),
+                Align2::LEFT_TOP,
+                "Out of Quota",
+                FontId::proportional(11.0),
+                Color32::from_rgba_unmultiplied(255, 90, 90, text_a),
+            );
+        }
+        if show_weekly_limits && !lim.weekly_exhausted() {
+            if let Some(weekly) = &lim.weekly {
+                let badge_str = format!("нед. {:.0}%", weekly.remaining_percent);
+                let badge_font = FontId::proportional(10.0);
+                let badge_color = Color32::from_rgba_unmultiplied(214, 150, 74, text_a);
+                let badge_g = painter.layout_no_wrap(badge_str.clone(), badge_font, badge_color);
+                let h_pad = 4.0;
+                let v_pad = 1.5;
+                let b_w = badge_g.size().x + h_pad * 2.0;
+                let b_h = badge_g.size().y + v_pad * 2.0;
+                let b_left = title_rect.right() + 5.0;
+                let b_top = y + (title_rect.height() - b_h) / 2.0;
+                let b_rect = Rect::from_min_size(Pos2::new(b_left, b_top), Vec2::new(b_w, b_h));
+
+                painter.rect_filled(
+                    b_rect,
+                    egui::Rounding::same(3.5),
+                    Color32::from_rgba_unmultiplied(214, 150, 74, (0.15 * 255.0) as u8),
+                );
+                painter.galley(
+                    Pos2::new(b_left + h_pad, b_top + v_pad),
+                    badge_g,
+                    badge_color,
+                );
+            }
+        }
         let reset_text = match reset {
             Some((abs, rel)) => format!("Resets {abs} · {rel}"),
+            None if lim.weekly_exhausted() => "время сброса неизвестно".to_string(),
             None => "окно ещё не начато".to_string(),
         };
         let reset_rect = painter.text(
@@ -634,7 +672,9 @@ fn draw_limit(
             FontId::proportional(11.0),
             dim,
         );
-        let pct_text = if show {
+        let pct_text = if show && lim.weekly_exhausted() {
+            String::new()
+        } else if show {
             format!("{:.0}%", lim.used_percent)
         } else {
             "—".to_string()
@@ -1021,5 +1061,82 @@ mod tests {
         assert_eq!(rel(25 * 3600), "1d 1h");
         assert_eq!(rel(0), "обновление…", "the clock ran out, wait for a poll");
         assert_eq!(rel(-30), "обновление…");
+    }
+}
+
+#[cfg(test)]
+mod weekly_render_tests {
+    use super::*;
+    #[test]
+    fn weekly_lockout_draws_red_status_without_overlapping_text() {
+        for _language in [()] {
+            for title in ["Gemini", "Claude / GPT"] {
+                for _compact in [false] {
+                    for show_weekly in [false, true] {
+                        let now = Utc::now();
+                        let lim = providers::Limit {
+                            title: title.into(),
+                            used_percent: 100.0,
+                            window: Some(providers::LimitWindow::ending_at(
+                                now + Duration::days(5),
+                                Duration::days(7),
+                                now,
+                            )),
+                            weekly: Some(providers::WeeklyQuota {
+                                remaining_percent: 0.0,
+                                resets_at: Some(now + Duration::days(5)),
+                            }),
+                        };
+                        let reset = fmt_reset(lim.window.unwrap().resets_at, now);
+                        let ctx = egui::Context::default();
+                        let output = ctx.run(egui::RawInput::default(), |ctx| {
+                            let painter = ctx.layer_painter(egui::LayerId::background());
+                            draw_limit(
+                                &painter,
+                                &lim,
+                                Some(&reset),
+                                12.0,
+                                418.0,
+                                8.0,
+                                now,
+                                0.8,
+                                255,
+                                Color32::GRAY,
+                                Color32::WHITE,
+                                true,
+                                false,
+                                0.0,
+                                0,
+                                show_weekly,
+                            );
+                        });
+                        let text: Vec<_> = output
+                            .shapes
+                            .iter()
+                            .filter_map(|shape| {
+                                if let egui::epaint::Shape::Text(t) = &shape.shape {
+                                    Some(t)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let status = text
+                            .iter()
+                            .find(|t| t.galley.job.text == "Out of Quota")
+                            .unwrap();
+                        let color = status.galley.job.sections[0].format.color;
+                        assert!(color.r() > 200 && color.g() < 120 && color.b() < 120);
+                        for other in text.iter().filter(|t| {
+                            !t.galley.job.text.is_empty() && t.galley.job.text != "Out of Quota"
+                        }) {
+                            let a = Rect::from_min_size(status.pos, status.galley.size());
+                            let b = Rect::from_min_size(other.pos, other.galley.size());
+                            assert!(!a.intersects(b), "overlap: {}", other.galley.job.text);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

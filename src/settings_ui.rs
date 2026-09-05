@@ -258,6 +258,20 @@ impl App {
                 pick(ui, HeaderMode::FamilyOnly, "Только семейство");
                 pick(ui, HeaderMode::Hidden, "Скрыть");
             });
+            ui.add_space(4.0);
+            if ui
+                .checkbox(&mut s.compact_mode, "Компактный режим (без полос)")
+                .changed()
+            {
+                s.save();
+            }
+            ui.label(
+                RichText::new(
+                    "Скрывать графические полосы для всех моделей, оставляя только текст",
+                )
+                .size(10.5)
+                .color(HINT),
+            );
         });
     }
 

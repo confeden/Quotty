@@ -125,6 +125,51 @@ fn force_topmost(hwnd: isize) {
 #[cfg(not(windows))]
 fn force_topmost(_hwnd: isize) {}
 
+#[cfg(windows)]
+fn show_context_menu(hwnd: isize, compact_mode: bool) -> Option<usize> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow,
+        TrackPopupMenu, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
+    };
+
+    unsafe {
+        let hmenu = CreatePopupMenu().ok()?;
+        let compact_text = if compact_mode {
+            "Обычный режим (с полосами)"
+        } else {
+            "Компактный режим (без полос)"
+        };
+        let _ = AppendMenuW(hmenu, MF_STRING, 1, &HSTRING::from(compact_text));
+        let _ = AppendMenuW(hmenu, MF_STRING, 2, &HSTRING::from("Настройки…"));
+
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(HWND(hwnd as *mut _));
+        let cmd = TrackPopupMenu(
+            hmenu,
+            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+            pt.x,
+            pt.y,
+            0,
+            HWND(hwnd as *mut _),
+            None,
+        );
+        let _ = DestroyMenu(hmenu);
+        if cmd.0 > 0 {
+            Some(cmd.0 as usize)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn show_context_menu(_hwnd: isize, _compact_mode: bool) -> Option<usize> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Repaint backstop
 //
@@ -432,8 +477,13 @@ impl App {
                     animate,
                     anim_t,
                     i,
+                    self.settings.compact_mode,
                 );
-                y += 34.0;
+                y += if self.settings.compact_mode {
+                    18.0
+                } else {
+                    34.0
+                };
             }
         } else if !online && ever {
             painter.text(
@@ -596,6 +646,7 @@ fn draw_limit(
     animate: bool,
     anim_t: f64,
     idx: usize,
+    compact: bool,
 ) {
     {
         // No window at all (the service has not opened one) → no clock: no time
@@ -651,6 +702,10 @@ fn draw_limit(
             FontId::proportional(12.5),
             pct_col,
         );
+
+        if compact {
+            return;
+        }
 
         // Single usage bar.
         let track_col = Color32::from_rgba_unmultiplied(60, 64, 76, (op * 220.0) as u8);
@@ -935,7 +990,15 @@ impl eframe::App for App {
 
         // Fit the window height to the number of limits — which changes when the
         // active family does (Claude has two windows, Antigravity three).
-        let want_h = 8.0 + 17.0 + n_limits as f32 * 34.0 + 6.0;
+        let want_h = 8.0
+            + 17.0
+            + n_limits as f32
+                * if self.settings.compact_mode {
+                    18.0
+                } else {
+                    34.0
+                }
+            + 6.0;
         if (want_h - self.applied_h).abs() > 0.5 {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(430.0, want_h)));
             self.applied_h = want_h;
@@ -966,7 +1029,29 @@ impl eframe::App for App {
                     self.dragging = true;
                 }
                 if resp.clicked_by(PointerButton::Secondary) {
-                    self.open_settings(true);
+                    #[cfg(windows)]
+                    {
+                        if let Some(h) = self.hwnd {
+                            if let Some(cmd) = show_context_menu(h, self.settings.compact_mode) {
+                                match cmd {
+                                    1 => {
+                                        self.settings.compact_mode = !self.settings.compact_mode;
+                                        self.settings.save();
+                                    }
+                                    2 => {
+                                        self.open_settings(true);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            self.open_settings(true);
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        self.open_settings(true);
+                    }
                 }
                 self.draw_strip(ui, anim_t, animate_on);
             });

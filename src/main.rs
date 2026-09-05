@@ -4,6 +4,7 @@
 mod active;
 mod app;
 mod config;
+mod i18n;
 mod icon;
 mod providers;
 mod settings_ui;

@@ -93,7 +93,7 @@ fn candidate_paths() -> Vec<PathBuf> {
 impl Settings {
     /// Resolved once: an existing file wins wherever it is, so load and save
     /// can never end up on different paths.
-    fn path() -> Option<PathBuf> {
+    pub fn path() -> Option<PathBuf> {
         static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
         PATH.get_or_init(|| {
             let candidates = candidate_paths();
@@ -104,6 +104,11 @@ impl Settings {
                 .or_else(|| candidates.into_iter().next())
         })
         .clone()
+    }
+
+    /// Directory containing settings.json (for diagnostics and Explorer).
+    pub fn dir() -> Option<PathBuf> {
+        Self::path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
     pub fn load() -> Self {

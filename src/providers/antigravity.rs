@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
-const RPC_PATH: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+const STATUS_RPC_PATH: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+const QUOTA_SUMMARY_RPC_PATH: &str =
+    "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 const REQUEST_BODY: &str = r#"{"metadata":{"ideName":"antigravity"}}"#;
 /// Antigravity quota windows roll over every 5 hours.
 const WINDOW_SECS: i64 = 5 * 3600;
@@ -195,9 +197,15 @@ fn from_main_log(path: &Path) -> Option<Endpoint> {
     let tail = &raw[raw.len().saturating_sub(256 * 1024)..];
     let text = String::from_utf8_lossy(tail);
 
-    let csrf = last_after(&text, "--csrf_token ", |c| {
-        c.is_ascii_alphanumeric() || c == '-'
-    })?;
+    let at = text.rfind("--csrf_token")? + "--csrf_token".len();
+    let csrf: String = text[at..]
+        .trim_start_matches([' ', '=', '"'])
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    if csrf.is_empty() {
+        return None;
+    }
     let port: u16 = last_after(&text, "127.0.0.1:", |c| c.is_ascii_digit())?
         .parse()
         .ok()?;
@@ -216,12 +224,9 @@ fn last_after(haystack: &str, marker: &str, keep: impl Fn(char) -> bool) -> Opti
 }
 
 // ---------------------------------------------------------------------------
-// Local HTTPS with a self-signed certificate
+// TLS with self-signed certificate acceptance
 // ---------------------------------------------------------------------------
 
-/// Accepts any certificate. Only ever used for 127.0.0.1, where the language
-/// server generates a throw-away self-signed cert at every launch, and where
-/// the CSRF token — not the certificate — is what authenticates the call.
 #[derive(Debug)]
 struct AcceptAnyCert(Arc<rustls::crypto::CryptoProvider>);
 
@@ -231,7 +236,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
         _end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
+        _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
@@ -299,7 +304,7 @@ fn remember(ep: &Endpoint) {
 }
 
 // ---------------------------------------------------------------------------
-// RPC response
+// RPC responses
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -368,6 +373,47 @@ struct QuotaInfo {
     reset_time: Option<serde_json::Value>,
 }
 
+// --- RetrieveUserQuotaSummary structures ---
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaSummaryResponse {
+    #[serde(default)]
+    response: Option<QuotaSummaryData>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaSummaryData {
+    #[serde(default)]
+    groups: Vec<QuotaGroup>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaGroup {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    buckets: Vec<QuotaBucket>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaBucket {
+    #[serde(default)]
+    bucket_id: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    display_name: Option<String>,
+    #[serde(default)]
+    window: Option<String>,
+    #[serde(default)]
+    remaining_fraction: Option<serde_json::Value>,
+    #[serde(default)]
+    reset_time: Option<serde_json::Value>,
+}
+
 pub fn fetch() -> Result<Snapshot, FetchError> {
     let eps = candidates();
     if eps.is_empty() {
@@ -378,15 +424,32 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
     let mut last_err = String::new();
     for ep in &eps {
         let started = std::time::Instant::now();
-        match call(ep) {
-            Ok(status) => {
+
+        // 1. First, try the new RetrieveUserQuotaSummary endpoint (macOS parity)
+        if let Ok(summary) = call_quota_summary(ep) {
+            let user_status = call_user_status(ep).ok();
+            let tier = user_status.as_ref().and_then(extract_tier_name);
+            if let Some(snap) = build_snapshot_from_summary(summary, tier) {
                 remember(ep);
                 diag(&format!(
-                    "antigravity: 200 from port {} in {} ms",
+                    "antigravity: 200 (RetrieveUserQuotaSummary) from port {} in {} ms",
                     ep.port,
                     started.elapsed().as_millis()
                 ));
-                return Ok(build_snapshot(status));
+                return Ok(snap);
+            }
+        }
+
+        // 2. Fallback: GetUserStatus
+        match call_user_status(ep) {
+            Ok(status) => {
+                remember(ep);
+                diag(&format!(
+                    "antigravity: 200 (fallback GetUserStatus) from port {} in {} ms",
+                    ep.port,
+                    started.elapsed().as_millis()
+                ));
+                return Ok(build_snapshot_legacy(status));
             }
             Err(e) => {
                 diag(&format!("antigravity: port {} -> {e}", ep.port));
@@ -401,8 +464,26 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
     Err(format!("Antigravity не отвечает ({last_err})").into())
 }
 
-fn call(ep: &Endpoint) -> Result<UserStatus, String> {
-    let url = format!("https://127.0.0.1:{}{RPC_PATH}", ep.port);
+fn call_quota_summary(ep: &Endpoint) -> Result<QuotaSummaryData, String> {
+    let url = format!("https://127.0.0.1:{}{QUOTA_SUMMARY_RPC_PATH}", ep.port);
+    let resp = agent()
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .set("X-Codeium-Csrf-Token", &ep.csrf)
+        .set("Connect-Protocol-Version", "1")
+        .send_string(REQUEST_BODY)
+        .map_err(|e| match e {
+            ureq::Error::Status(code, _) => format!("quota summary status {code}"),
+            e => format!("{e}"),
+        })?;
+    let parsed: QuotaSummaryResponse = resp
+        .into_json()
+        .map_err(|e| format!("parse quota summary: {e}"))?;
+    parsed.response.ok_or("нет response в QuotaSummary".into())
+}
+
+fn call_user_status(ep: &Endpoint) -> Result<UserStatus, String> {
+    let url = format!("https://127.0.0.1:{}{STATUS_RPC_PATH}", ep.port);
     let resp = agent()
         .post(&url)
         .set("Content-Type", "application/json")
@@ -417,6 +498,97 @@ fn call(ep: &Endpoint) -> Result<UserStatus, String> {
     parsed.user_status.ok_or("нет userStatus в ответе".into())
 }
 
+const GROUP_TITLES: [&str; 2] = ["Gemini", "Claude / GPT"];
+
+fn extract_tier_name(status: &UserStatus) -> Option<String> {
+    status
+        .user_tier
+        .as_ref()
+        .and_then(|t| t.name.clone())
+        .or_else(|| {
+            status
+                .plan_status
+                .as_ref()
+                .and_then(|p| p.plan_info.as_ref())
+                .and_then(|p| p.plan_name.clone())
+        })
+}
+
+fn build_snapshot_from_summary(
+    summary: QuotaSummaryData,
+    tier_name: Option<String>,
+) -> Option<Snapshot> {
+    let now = Utc::now();
+    let mut limits_by_group: [Option<Limit>; 2] = [None, None];
+
+    for group in summary.groups {
+        let name = group.display_name.as_deref().unwrap_or("").to_lowercase();
+        let group_idx = if name.contains("gemini") {
+            0
+        } else if name.contains("claude") || name.contains("gpt") {
+            1
+        } else {
+            continue;
+        };
+
+        // Main limit: 5h bucket
+        let main_bucket = group.buckets.iter().find(|b| {
+            let win = b.window.as_deref().unwrap_or("");
+            let id = b.bucket_id.as_deref().unwrap_or("");
+            win == "5h" || id.contains("5h")
+        });
+
+        // Weekly bucket: for badge
+        let weekly_bucket = group.buckets.iter().find(|b| {
+            let win = b.window.as_deref().unwrap_or("");
+            let id = b.bucket_id.as_deref().unwrap_or("");
+            win == "weekly" || id.contains("weekly")
+        });
+
+        let weekly_badge = weekly_bucket.map(|wb| {
+            // In proto3 JSON, 0.0 is omitted. If remaining_fraction is missing, treat as 0.0 (0% remaining).
+            let rem = as_f64(wb.remaining_fraction.as_ref())
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            format!("нед. {:.0}%", (rem * 100.0).round())
+        });
+
+        if let Some(mb) = main_bucket {
+            let rem = as_f64(mb.remaining_fraction.as_ref())
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0) as f32;
+            let reset = as_time(mb.reset_time.as_ref());
+            let resets_at = reset.unwrap_or(now + chrono::Duration::seconds(WINDOW_SECS));
+            limits_by_group[group_idx] = Some(Limit {
+                title: GROUP_TITLES[group_idx].to_string(),
+                used_percent: (1.0 - rem) * 100.0,
+                window: Some(LimitWindow::ending_at(
+                    resets_at,
+                    chrono::Duration::seconds(WINDOW_SECS),
+                    now,
+                )),
+                badge: weekly_badge,
+            });
+        }
+    }
+
+    let limits: Vec<Limit> = limits_by_group.into_iter().flatten().collect();
+    if limits.is_empty() {
+        return None;
+    }
+
+    let plan = match tier_name {
+        Some(t) if !t.is_empty() => format!("Antigravity · {t}"),
+        _ => "Antigravity".to_string(),
+    };
+
+    Some(Snapshot {
+        family: Family::Antigravity,
+        plan,
+        limits,
+    })
+}
+
 /// Model label → the quota group it draws from. All Gemini models (Pro *and*
 /// Flash) spend from one shared pool; the third-party models have their own.
 fn group_of(label: &str) -> usize {
@@ -427,10 +599,9 @@ fn group_of(label: &str) -> usize {
     }
 }
 
-const GROUP_TITLES: [&str; 2] = ["Gemini", "Claude / GPT"];
-
-fn build_snapshot(status: UserStatus) -> Snapshot {
+fn build_snapshot_legacy(status: UserStatus) -> Snapshot {
     let now = Utc::now();
+    let tier = extract_tier_name(&status);
     // Per group: worst (smallest) remaining fraction and earliest reset, so the
     // bar shows the limit the user will actually hit first.
     let mut worst: [Option<(f32, Option<DateTime<Utc>>)>; GROUP_TITLES.len()] = [None, None];
@@ -443,9 +614,9 @@ fn build_snapshot(status: UserStatus) -> Snapshot {
         let (Some(label), Some(q)) = (cfg.label, cfg.quota_info) else {
             continue;
         };
-        let Some(remaining) = as_f64(q.remaining_fraction.as_ref()) else {
-            continue;
-        };
+        // In proto3 JSON, default float/double 0.0 is omitted during serialization.
+        // When quotaInfo is present, missing remainingFraction indicates 0.0 (exhausted / 100% used).
+        let remaining = as_f64(q.remaining_fraction.as_ref()).unwrap_or(0.0);
         let reset = as_time(q.reset_time.as_ref());
         let g = group_of(&label);
         let remaining = remaining.clamp(0.0, 1.0) as f32;
@@ -481,15 +652,10 @@ fn build_snapshot(status: UserStatus) -> Snapshot {
                 chrono::Duration::seconds(WINDOW_SECS),
                 now,
             )),
+            badge: None,
         });
     }
 
-    let tier = status.user_tier.and_then(|t| t.name).or_else(|| {
-        status
-            .plan_status
-            .and_then(|p| p.plan_info)
-            .and_then(|p| p.plan_name)
-    });
     let plan = match tier {
         Some(t) if !t.is_empty() => format!("Antigravity · {t}"),
         _ => "Antigravity".to_string(),
@@ -522,5 +688,105 @@ fn as_time(v: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
             Utc.timestamp_opt(secs, 0).single()
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_quota_summary_with_weekly_and_5h() {
+        let json = r#"{
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-weekly",
+                            "window": "weekly",
+                            "remainingFraction": 0.714,
+                            "resetTime": "2026-09-10T20:20:36Z"
+                        },
+                        {
+                            "bucketId": "gemini-5h",
+                            "window": "5h",
+                            "remainingFraction": 0.808,
+                            "resetTime": "2026-09-04T17:34:00Z"
+                        }
+                    ]
+                },
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        {
+                            "bucketId": "3p-weekly",
+                            "window": "weekly",
+                            "remainingFraction": 0.329,
+                            "resetTime": "2026-09-10T21:23:24Z"
+                        },
+                        {
+                            "bucketId": "3p-5h",
+                            "window": "5h",
+                            "remainingFraction": 1.0,
+                            "resetTime": "2026-09-04T18:00:04Z"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let summary: QuotaSummaryData = serde_json::from_str(json).unwrap();
+        let snap = build_snapshot_from_summary(summary, Some("Google AI Pro".into())).unwrap();
+
+        assert_eq!(snap.plan, "Antigravity · Google AI Pro");
+        assert_eq!(snap.limits.len(), 2);
+
+        let gemini = &snap.limits[0];
+        assert_eq!(gemini.title, "Gemini");
+        assert!((gemini.used_percent - (1.0 - 0.808) * 100.0).abs() < 0.1);
+        assert_eq!(gemini.badge.as_deref(), Some("нед. 71%"));
+        let w = gemini.window.unwrap();
+        assert_eq!(
+            w.resets_at - w.start.unwrap(),
+            chrono::Duration::seconds(5 * 3600)
+        );
+
+        let claude = &snap.limits[1];
+        assert_eq!(claude.title, "Claude / GPT");
+        assert!((claude.used_percent - 0.0).abs() < 0.1);
+        assert_eq!(claude.badge.as_deref(), Some("нед. 33%"));
+    }
+
+    #[test]
+    fn parse_quota_summary_proto3_missing_fraction_defaults_to_zero() {
+        // Proto3 omits 0.0 floats: remainingFraction omitted means 0.0
+        let json = r#"{
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-weekly",
+                            "window": "weekly",
+                            "resetTime": "2026-09-10T20:20:36Z"
+                        },
+                        {
+                            "bucketId": "gemini-5h",
+                            "window": "5h",
+                            "resetTime": "2026-09-04T17:34:00Z"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let summary: QuotaSummaryData = serde_json::from_str(json).unwrap();
+        let snap = build_snapshot_from_summary(summary, None).unwrap();
+
+        assert_eq!(snap.limits.len(), 1);
+        let gemini = &snap.limits[0];
+        assert_eq!(gemini.used_percent, 100.0);
+        assert_eq!(gemini.badge.as_deref(), Some("нед. 0%"));
     }
 }

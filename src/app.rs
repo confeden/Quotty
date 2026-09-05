@@ -432,6 +432,7 @@ impl App {
                     animate,
                     anim_t,
                     i,
+                    self.settings.show_weekly_limits,
                 );
                 y += 34.0;
             }
@@ -596,6 +597,7 @@ fn draw_limit(
     animate: bool,
     anim_t: f64,
     idx: usize,
+    show_weekly_limits: bool,
 ) {
     {
         // No window at all (the service has not opened one) → no clock: no time
@@ -616,13 +618,38 @@ fn draw_limit(
         let overspend = show && !exhausted && time_frac.is_some_and(|t| use_frac > t + 0.02);
 
         // Title line: name (left) + reset time (far right) + used% (left of it).
-        painter.text(
+        let title_rect = painter.text(
             Pos2::new(left, y),
             Align2::LEFT_TOP,
             &lim.title,
             FontId::proportional(12.5),
             strong,
         );
+        if show_weekly_limits {
+            if let Some(badge_str) = &lim.badge {
+                let badge_font = FontId::proportional(10.0);
+                let badge_color = Color32::from_rgba_unmultiplied(214, 150, 74, text_a);
+                let badge_g = painter.layout_no_wrap(badge_str.clone(), badge_font, badge_color);
+                let h_pad = 4.0;
+                let v_pad = 1.5;
+                let b_w = badge_g.size().x + h_pad * 2.0;
+                let b_h = badge_g.size().y + v_pad * 2.0;
+                let b_left = title_rect.right() + 5.0;
+                let b_top = y + (title_rect.height() - b_h) / 2.0;
+                let b_rect = Rect::from_min_size(Pos2::new(b_left, b_top), Vec2::new(b_w, b_h));
+
+                painter.rect_filled(
+                    b_rect,
+                    egui::Rounding::same(3.5),
+                    Color32::from_rgba_unmultiplied(214, 150, 74, (0.15 * 255.0) as u8),
+                );
+                painter.galley(
+                    Pos2::new(b_left + h_pad, b_top + v_pad),
+                    badge_g,
+                    badge_color,
+                );
+            }
+        }
         let reset_text = match reset {
             Some((abs, rel)) => format!("Resets {abs} · {rel}"),
             None => "окно ещё не начато".to_string(),

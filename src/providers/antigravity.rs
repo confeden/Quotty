@@ -7,7 +7,7 @@
 //! authenticates callers with a per-launch CSRF token, so we need both the port
 //! and that token, and we must skip certificate verification for it.
 
-use super::{dbg_log, diag, Family, FetchError, Limit, LimitWindow, Snapshot};
+use super::{dbg_log, diag, Family, FetchError, Limit, LimitWindow, Snapshot, WeeklyQuota};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -545,29 +545,43 @@ fn build_snapshot_from_summary(
             win == "weekly" || id.contains("weekly")
         });
 
-        let weekly_badge = weekly_bucket.map(|wb| {
+        let weekly = weekly_bucket.map(|wb| {
             // In proto3 JSON, 0.0 is omitted. If remaining_fraction is missing, treat as 0.0 (0% remaining).
             let rem = as_f64(wb.remaining_fraction.as_ref())
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
-            format!("нед. {:.0}%", (rem * 100.0).round())
+            WeeklyQuota {
+                remaining_percent: (rem * 100.0) as f32,
+                resets_at: as_time(wb.reset_time.as_ref()),
+            }
         });
 
-        if let Some(mb) = main_bucket {
-            let rem = as_f64(mb.remaining_fraction.as_ref())
+        let weekly_exhausted = weekly.is_some_and(|w| w.remaining_percent <= 0.0);
+        if main_bucket.is_some() || weekly_exhausted {
+            let rem = main_bucket
+                .and_then(|b| as_f64(b.remaining_fraction.as_ref()))
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0) as f32;
-            let reset = as_time(mb.reset_time.as_ref());
-            let resets_at = reset.unwrap_or(now + chrono::Duration::seconds(WINDOW_SECS));
+            // A weekly lockout supersedes the session, even when its 5h bucket
+            // reports 100% remaining or is absent. Never invent a reset time.
+            let (reset, seconds) = if weekly_exhausted {
+                (weekly.and_then(|w| w.resets_at), 7 * 24 * 3600)
+            } else {
+                (
+                    main_bucket.and_then(|b| as_time(b.reset_time.as_ref())),
+                    WINDOW_SECS,
+                )
+            };
             limits_by_group[group_idx] = Some(Limit {
                 title: GROUP_TITLES[group_idx].to_string(),
-                used_percent: (1.0 - rem) * 100.0,
-                window: Some(LimitWindow::ending_at(
-                    resets_at,
-                    chrono::Duration::seconds(WINDOW_SECS),
-                    now,
-                )),
-                badge: weekly_badge,
+                used_percent: if weekly_exhausted {
+                    100.0
+                } else {
+                    (1.0 - rem) * 100.0
+                },
+                window: reset
+                    .map(|r| LimitWindow::ending_at(r, chrono::Duration::seconds(seconds), now)),
+                weekly,
             });
         }
     }
@@ -652,7 +666,7 @@ fn build_snapshot_legacy(status: UserStatus) -> Snapshot {
                 chrono::Duration::seconds(WINDOW_SECS),
                 now,
             )),
-            badge: None,
+            weekly: None,
         });
     }
 
@@ -745,7 +759,7 @@ mod tests {
         let gemini = &snap.limits[0];
         assert_eq!(gemini.title, "Gemini");
         assert!((gemini.used_percent - (1.0 - 0.808) * 100.0).abs() < 0.1);
-        assert_eq!(gemini.badge.as_deref(), Some("нед. 71%"));
+        assert!((gemini.weekly.unwrap().remaining_percent - 71.4).abs() < 0.01);
         let w = gemini.window.unwrap();
         assert_eq!(
             w.resets_at - w.start.unwrap(),
@@ -755,7 +769,7 @@ mod tests {
         let claude = &snap.limits[1];
         assert_eq!(claude.title, "Claude / GPT");
         assert!((claude.used_percent - 0.0).abs() < 0.1);
-        assert_eq!(claude.badge.as_deref(), Some("нед. 33%"));
+        assert!((claude.weekly.unwrap().remaining_percent - 32.9).abs() < 0.01);
     }
 
     #[test]
@@ -787,6 +801,65 @@ mod tests {
         assert_eq!(snap.limits.len(), 1);
         let gemini = &snap.limits[0];
         assert_eq!(gemini.used_percent, 100.0);
-        assert_eq!(gemini.badge.as_deref(), Some("нед. 0%"));
+        assert!(gemini.weekly_exhausted());
+    }
+}
+
+#[cfg(test)]
+mod weekly_tests {
+    use super::*;
+
+    fn snapshot(buckets: serde_json::Value) -> Snapshot {
+        let summary = serde_json::from_value(serde_json::json!({"groups": [{
+            "displayName": "Claude and GPT models", "buckets": buckets
+        }]}))
+        .unwrap();
+        build_snapshot_from_summary(summary, None).unwrap()
+    }
+
+    #[test]
+    fn weekly_zero_overrides_unused_session_and_uses_weekly_reset() {
+        for remaining in [
+            serde_json::json!(0.0),
+            serde_json::json!("0"),
+            serde_json::Value::Null,
+        ] {
+            let snap = snapshot(serde_json::json!([
+                {"window":"weekly", "remainingFraction":remaining, "resetTime":"2030-09-10T20:20:36Z"},
+                {"window":"5h", "remainingFraction":1.0, "resetTime":"2030-09-05T20:20:36Z"}
+            ]));
+            let limit = &snap.limits[0];
+            assert!(limit.weekly_exhausted());
+            assert_eq!(limit.used_percent, 100.0);
+            assert_eq!(
+                limit.window.unwrap().resets_at.to_rfc3339(),
+                "2030-09-10T20:20:36+00:00"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_weekly_bucket_can_stand_alone_without_a_made_up_timer() {
+        let snap = snapshot(serde_json::json!([{"window":"weekly"}]));
+        assert!(snap.limits[0].weekly_exhausted());
+        assert_eq!(snap.limits[0].used_percent, 100.0);
+        assert!(snap.limits[0].window.is_none());
+    }
+
+    #[test]
+    fn positive_weekly_fraction_is_not_exhausted_even_when_badge_rounds_to_zero() {
+        let snap = snapshot(serde_json::json!([
+            {"window":"weekly", "remainingFraction":0.001},
+            {"window":"5h", "remainingFraction":1.0}
+        ]));
+        assert!(!snap.limits[0].weekly_exhausted());
+        assert_eq!(snap.limits[0].used_percent, 0.0);
+    }
+
+    #[test]
+    fn absent_weekly_bucket_preserves_session_quota() {
+        let snap = snapshot(serde_json::json!([{"window":"5h", "remainingFraction":0.25}]));
+        assert!(!snap.limits[0].weekly_exhausted());
+        assert_eq!(snap.limits[0].used_percent, 75.0);
     }
 }

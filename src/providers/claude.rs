@@ -551,7 +551,7 @@ fn build_snapshot(usage: UsageResponse, tok: &OauthToken) -> Snapshot {
             used_percent: w.utilization.unwrap_or(0.0) as f32,
             window: parse_ts(&w.resets_at)
                 .map(|reset| LimitWindow::ending_at(reset, chrono::Duration::hours(5), now)),
-            badge: None,
+            weekly: None,
         });
     }
     if let Some(w) = usage.seven_day {
@@ -560,7 +560,7 @@ fn build_snapshot(usage: UsageResponse, tok: &OauthToken) -> Snapshot {
             used_percent: w.utilization.unwrap_or(0.0) as f32,
             window: parse_ts(&w.resets_at)
                 .map(|reset| LimitWindow::ending_at(reset, chrono::Duration::days(7), now)),
-            badge: None,
+            weekly: None,
         });
     }
     for l in &limits {

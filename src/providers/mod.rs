@@ -53,8 +53,20 @@ pub struct Limit {
     /// on screen: the limit exists and stands at 0 %, there is just no clock to
     /// draw against.
     pub window: Option<LimitWindow>,
-    /// Optional badge rendered next to model title (e.g. "нед. 71%").
-    pub badge: Option<String>,
+    /// Weekly quota reported independently of the session quota.
+    pub weekly: Option<WeeklyQuota>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct WeeklyQuota {
+    pub remaining_percent: f32,
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+impl Limit {
+    pub fn weekly_exhausted(&self) -> bool {
+        self.weekly.is_some_and(|w| w.remaining_percent <= 0.0)
+    }
 }
 
 /// The stretch of time a limit is measured over.

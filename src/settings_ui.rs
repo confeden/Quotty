@@ -258,6 +258,13 @@ impl App {
                 pick(ui, HeaderMode::FamilyOnly, "Только семейство");
                 pick(ui, HeaderMode::Hidden, "Скрыть");
             });
+            ui.add_space(4.0);
+            if ui
+                .checkbox(&mut s.auto_hide_on_inactive, "Показывать только в окне ИИ")
+                .changed()
+            {
+                s.save();
+            }
         });
     }
 

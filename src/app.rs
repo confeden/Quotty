@@ -10,7 +10,7 @@ use crate::update::{self, UpdateState};
 use chrono::{DateTime, Duration, Local, Utc};
 use eframe::egui;
 use egui::{Align2, Color32, FontId, PointerButton, Pos2, Rect, Sense, Vec2, ViewportCommand};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Latest fetch state of one family. `last` keeps the most recent *successful*
@@ -70,6 +70,8 @@ pub struct App {
     /// Family currently on screen.
     pub(crate) active: Family,
     detector: active::Detector,
+    is_ai_active: bool,
+    is_visible: bool,
     /// Height we last asked the OS for, so we only resize when it changes.
     applied_h: f32,
     /// Cached "Resets …" strings, refreshed at most once per second.
@@ -124,6 +126,24 @@ fn force_topmost(hwnd: isize) {
 
 #[cfg(not(windows))]
 fn force_topmost(_hwnd: isize) {}
+
+pub(crate) static NATIVE_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Show or hide the native window without stealing focus.
+#[cfg(windows)]
+pub(crate) fn set_native_visible(hwnd: isize, visible: bool) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNA};
+    unsafe {
+        let _ = ShowWindow(
+            HWND(hwnd as *mut _),
+            if visible { SW_SHOWNA } else { SW_HIDE },
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn set_native_visible(_hwnd: isize, _visible: bool) {}
 
 // ---------------------------------------------------------------------------
 // Repaint backstop
@@ -222,6 +242,8 @@ impl App {
             wake.request_repaint();
         }));
 
+        active::spawn_watcher(cc.egui_ctx.clone());
+
         Self {
             active: settings.family,
             settings,
@@ -233,6 +255,8 @@ impl App {
             settings_h: 640.0,
             autostart,
             detector: active::Detector::default(),
+            is_ai_active: true,
+            is_visible: true,
             applied_h: 0.0,
             reset_cache: Vec::new(),
             reset_cache_sec: 0,
@@ -283,9 +307,12 @@ impl App {
     /// Follow the foreground window (or the pinned choice) and, on a switch,
     /// ask the poller to refresh that family right away.
     fn update_active(&mut self, t: f64) {
+        let active_status = self.detector.poll(t);
+        self.is_ai_active = active_status.is_ai;
+
         let target = match self.settings.active_mode {
             ActiveMode::Pinned => self.settings.family,
-            ActiveMode::Auto => match self.detector.poll(t) {
+            ActiveMode::Auto => match active_status.family {
                 Some(f) if self.settings.enabled(f) => f,
                 _ => self.active,
             },
@@ -897,10 +924,34 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         LAST_PAINT_MS.store(uptime_ms(), Ordering::Relaxed);
+        if self.hwnd.is_none() {
+            self.hwnd = native_hwnd(frame);
+            if let Some(h) = self.hwnd {
+                NATIVE_HWND.store(h, Ordering::Relaxed);
+            }
+        }
         self.handle_tray_events(ctx);
 
         let anim_t = ctx.input(|i| i.time);
         self.update_active(anim_t);
+
+        // Smart Focus: auto-hide when foreground app is not an AI tool or editor.
+        // Keep visible for the first 10 seconds after launch so the user sees Quotty start.
+        let in_grace_period = anim_t < 10.0;
+        let should_show = if self.show_settings || in_grace_period {
+            true
+        } else if self.settings.auto_hide_on_inactive {
+            self.is_ai_active
+        } else {
+            true
+        };
+
+        if should_show != self.is_visible {
+            self.is_visible = should_show;
+            if let Some(h) = self.hwnd {
+                set_native_visible(h, should_show);
+            }
+        }
 
         // Snapshot animation-relevant state under one lock.
         let animate_on = self.settings.animate;

@@ -45,6 +45,7 @@ pub struct Settings {
     pub family: Family,
     /// Verbose, anonymised logging next to the exe. Off unless asked for.
     pub diagnostics: bool,
+    pub auto_hide_on_inactive: bool,
 }
 
 impl Default for Settings {
@@ -61,6 +62,7 @@ impl Default for Settings {
             active_mode: ActiveMode::Auto,
             family: Family::Claude,
             diagnostics: false,
+            auto_hide_on_inactive: true,
         }
     }
 }

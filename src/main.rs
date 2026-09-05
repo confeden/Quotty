@@ -23,7 +23,6 @@ fn main() -> eframe::Result<()> {
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
-        .with_resizable(false)
         .with_taskbar(false);
     if let Some((x, y)) = settings.pos {
         viewport = viewport.with_position([x, y]);

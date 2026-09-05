@@ -24,6 +24,22 @@ pub enum ActiveMode {
     Pinned,
 }
 
+/// How exhausted quotas (100% used) are displayed.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExhaustedMode {
+    /// Hide progress bar, show compact single line with reset timer (default).
+    #[default]
+    #[serde(alias = "Compact")]
+    Compact,
+    /// Completely hide from list (timer moves to header badge), unless all are exhausted.
+    #[serde(alias = "Hidden")]
+    Hidden,
+    /// Classic display with full orange bar.
+    #[serde(alias = "Full")]
+    Full,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -45,6 +61,7 @@ pub struct Settings {
     pub family: Family,
     /// Verbose, anonymised logging next to the exe. Off unless asked for.
     pub diagnostics: bool,
+    pub exhausted_mode: ExhaustedMode,
 }
 
 impl Default for Settings {
@@ -61,6 +78,7 @@ impl Default for Settings {
             active_mode: ActiveMode::Auto,
             family: Family::Claude,
             diagnostics: false,
+            exhausted_mode: ExhaustedMode::Compact,
         }
     }
 }

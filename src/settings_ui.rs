@@ -20,7 +20,7 @@ const DIM: Color32 = Color32::from_rgb(176, 184, 200);
 const HINT: Color32 = Color32::from_rgb(158, 167, 184);
 const WARN: Color32 = Color32::from_rgb(238, 162, 92);
 
-const WIN_W: f32 = 430.0;
+const WIN_W: f32 = 460.0;
 const WIN_TITLE: &str = "Quotty — настройки";
 const AUTHOR_URL: &str = "https://t.me/nova_txt";
 
@@ -52,11 +52,11 @@ pub fn apply_style(ctx: &egui::Context) {
         w.rounding = Rounding::same(7.0);
         w.bg_stroke = Stroke::NONE;
         // Checkmarks and slider handles, not label text.
-        w.fg_stroke = Stroke::new(1.8, ACCENT);
+        w.fg_stroke = Stroke::new(1.8_f32, ACCENT);
     }
     v.widgets.noninteractive.rounding = Rounding::same(7.0);
     v.widgets.noninteractive.bg_stroke = Stroke::NONE;
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.inactive.bg_fill = CARD_HI;
     v.widgets.inactive.weak_bg_fill = CARD_HI;
     v.widgets.hovered.bg_fill = Color32::from_rgb(60, 66, 80);
@@ -64,7 +64,7 @@ pub fn apply_style(ctx: &egui::Context) {
     v.widgets.active.bg_fill = Color32::from_rgb(70, 77, 92);
     v.widgets.active.weak_bg_fill = Color32::from_rgb(70, 77, 92);
     v.selection.bg_fill = ACCENT_BG;
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
 
     style.visuals = v;
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
@@ -124,11 +124,10 @@ impl App {
                             egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
                         )
                         .show(ui, |ui| {
+                            self.tools_card(ui);
                             self.appearance_card(ui);
-                            self.sources_card(ui);
                             refresh_now |= self.polling_card(ui);
-                            self.system_card(ui);
-                            check_update |= self.version_card(ui);
+                            self.diagnostics_card(ui, &mut check_update);
 
                             ui.add_space(8.0);
                             ui.with_layout(
@@ -213,57 +212,7 @@ impl App {
         close
     }
 
-    fn appearance_card(&mut self, ui: &mut egui::Ui) {
-        card(ui, "ВНЕШНИЙ ВИД", |ui| {
-            let s = &mut self.settings;
-            value_row(ui, "Непрозрачность", &format!("{:.0}%", s.opacity * 100.0));
-            if full_width_slider(ui, &mut s.opacity, 0.2..=1.0) {
-                s.save();
-            }
-
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
-                for (label, val) in [
-                    ("100%", 1.0f32),
-                    ("80%", 0.8),
-                    ("66%", 0.66),
-                    ("50%", 0.5),
-                    ("33%", 0.33),
-                    ("20%", 0.2),
-                ] {
-                    let on = (s.opacity - val).abs() < 0.005;
-                    if ui.selectable_label(on, label).clicked() {
-                        s.opacity = val;
-                        s.save();
-                    }
-                }
-            });
-
-            ui.add_space(2.0);
-            if ui.checkbox(&mut s.animate, "Анимация пузырьков").changed() {
-                s.save();
-            }
-
-            ui.add_space(4.0);
-            caption(ui, "Заголовок строки");
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
-                let mut pick = |ui: &mut egui::Ui, mode: HeaderMode, label: &str| {
-                    if ui.selectable_label(s.header_mode == mode, label).clicked() {
-                        s.header_mode = mode;
-                        s.save();
-                    }
-                };
-                pick(ui, HeaderMode::Full, "Среда и тариф");
-                pick(ui, HeaderMode::FamilyOnly, "Только семейство");
-                pick(ui, HeaderMode::Hidden, "Скрыть");
-            });
-        });
-    }
-
-    fn sources_card(&mut self, ui: &mut egui::Ui) {
-        // Read each family's live state first: the card doubles as the place to
-        // see whether a source is actually being picked up.
+    fn tools_card(&mut self, ui: &mut egui::Ui) {
         let status: Vec<(bool, bool, Option<String>)> = {
             let st = self.shared.states.lock().unwrap();
             Family::ALL
@@ -275,7 +224,7 @@ impl App {
                 .collect()
         };
 
-        card(ui, "ИСТОЧНИКИ", |ui| {
+        card(ui, "ИНСТРУМЕНТЫ", |ui| {
             for f in Family::ALL {
                 let (online, ever, err) = &status[f.idx()];
                 ui.horizontal(|ui| {
@@ -302,32 +251,39 @@ impl App {
             }
 
             ui.add_space(4.0);
-            caption(ui, "Что показывать на строке");
+            caption(ui, "Режим переключения");
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 5.0;
                 let auto = self.settings.active_mode == ActiveMode::Auto;
-                if ui.selectable_label(auto, "Активный").clicked() {
+                if ui.selectable_label(auto, "Авто (по окну)").clicked() {
                     self.settings.active_mode = ActiveMode::Auto;
                     self.settings.save();
                 }
-                for f in Family::ALL {
-                    if !self.settings.enabled(f) {
-                        continue;
-                    }
-                    let on = self.settings.active_mode == ActiveMode::Pinned
-                        && self.settings.family == f;
-                    if ui.selectable_label(on, f.name()).clicked() {
-                        self.settings.active_mode = ActiveMode::Pinned;
-                        self.settings.family = f;
-                        self.active = f;
-                        self.settings.save();
-                    }
+                let pinned = self.settings.active_mode == ActiveMode::Pinned;
+                if ui.selectable_label(pinned, "Закрепить").clicked() {
+                    self.settings.active_mode = ActiveMode::Pinned;
+                    self.settings.save();
                 }
             });
+            if self.settings.active_mode == ActiveMode::Pinned {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    for f in Family::ALL {
+                        if !self.settings.enabled(f) {
+                            continue;
+                        }
+                        let on = self.settings.family == f;
+                        if ui.selectable_label(on, f.name()).clicked() {
+                            self.settings.family = f;
+                            self.active = f;
+                            self.settings.save();
+                        }
+                    }
+                });
+            }
             ui.label(
                 RichText::new(
-                    "«Активный» — квота того инструмента, окно которого было\n\
-                     на переднем плане последним (приложение, IDE или CLI).",
+                    "«Авто» — квота того инструмента, окно которого активно (IDE, терминал или приложение).",
                 )
                 .size(10.5)
                 .color(HINT),
@@ -335,70 +291,105 @@ impl App {
         });
     }
 
+    fn appearance_card(&mut self, ui: &mut egui::Ui) {
+        card(ui, "ОТОБРАЖЕНИЕ", |ui| {
+            let s = &mut self.settings;
+            value_row(ui, "Непрозрачность", &format!("{:.0}%", s.opacity * 100.0));
+            if full_width_slider(ui, &mut s.opacity, 0.2..=1.0) {
+                s.save();
+            }
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                for (label, val) in [("50%", 0.5f32), ("80%", 0.8f32), ("100%", 1.0f32)] {
+                    let on = (s.opacity - val).abs() < 0.005;
+                    if ui.selectable_label(on, label).clicked() {
+                        s.opacity = val;
+                        s.save();
+                    }
+                }
+            });
+
+            ui.add_space(4.0);
+            caption(ui, "Заголовок строки");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let mut pick = |ui: &mut egui::Ui, mode: HeaderMode, label: &str| {
+                    if ui.selectable_label(s.header_mode == mode, label).clicked() {
+                        s.header_mode = mode;
+                        s.save();
+                    }
+                };
+                pick(ui, HeaderMode::Full, "Полный");
+                pick(ui, HeaderMode::FamilyOnly, "Только имя");
+                pick(ui, HeaderMode::Hidden, "Скрыть");
+            });
+
+            ui.add_space(2.0);
+            if ui
+                .checkbox(&mut s.animate, "Анимация пузырьков (при расходе с запасом)")
+                .changed()
+            {
+                s.save();
+            }
+        });
+    }
+
     /// Returns true when "обновить сейчас" was pressed.
     fn polling_card(&mut self, ui: &mut egui::Ui) -> bool {
         let mut refresh = false;
-        card(ui, "ОПРОС КВОТ", |ui| {
+        card(ui, "ОПРОС И ОБНОВЛЕНИЕ", |ui| {
             let s = &mut self.settings;
-            value_row(ui, "Интервал опроса", &format!("{} с", s.poll_secs));
+            let display_secs = if s.poll_secs < 60 {
+                format!("{} с", s.poll_secs)
+            } else {
+                format!("{} мин", s.poll_secs / 60)
+            };
+            value_row(ui, "Интервал опроса", &display_secs);
             if full_width_slider(ui, &mut s.poll_secs, 15..=600) {
                 s.save();
             }
-            if ui.button("Обновить сейчас").clicked() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                for (label, val) in [
+                    ("15 сек", 15u64),
+                    ("30 сек", 30u64),
+                    ("60 сек", 60u64),
+                    ("2 мин", 120u64),
+                    ("5 мин", 300u64),
+                ] {
+                    let on = s.poll_secs == val;
+                    if ui.selectable_label(on, label).clicked() {
+                        s.poll_secs = val;
+                        s.save();
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            if ui.button("Обновить данные сейчас").clicked() {
                 refresh = true;
             }
         });
         refresh
     }
 
-    /// Version + the result of the GitHub release check. Returns "check now".
-    fn version_card(&mut self, ui: &mut egui::Ui) -> bool {
-        let (checked, available, failed) = {
-            let st = self.shared.update.lock().unwrap();
-            (st.checked, st.available.clone(), st.error.is_some())
-        };
-        let mut check = false;
-        card(ui, "ВЕРСИЯ", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("Quotty {}", crate::update::current()))
-                        .size(12.0)
-                        .color(TEXT),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (text, col) = match (&available, checked, failed) {
-                        (Some(u), _, _) => (format!("доступна {}", u.version), WARN),
-                        (None, true, false) => ("актуальная версия".to_string(), ACCENT),
-                        (None, true, true) => ("проверка не удалась".to_string(), HINT),
-                        _ => ("проверка…".to_string(), HINT),
-                    };
-                    ui.label(RichText::new(text).size(11.0).color(col));
-                });
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Проверить обновления").clicked() {
-                    check = true;
-                }
-                if let Some(u) = &available {
-                    ui.hyperlink_to(
-                        RichText::new("Открыть страницу релиза")
-                            .size(11.5)
-                            .color(ACCENT),
-                        u.url.clone(),
+    fn diagnostics_card(&mut self, ui: &mut egui::Ui, check_update: &mut bool) {
+        card(ui, "ДИАГНОСТИКА", |ui| {
+            if let Some(dir) = crate::config::Settings::dir() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Рабочая папка:").size(11.0).color(DIM));
+                    ui.label(
+                        RichText::new(dir.to_string_lossy().to_string())
+                            .size(11.0)
+                            .color(TEXT),
                     );
+                });
+                if ui.button("Открыть в проводнике").clicked() {
+                    reveal_path(&dir);
                 }
-            });
-            ui.label(
-                RichText::new("Проверка раз в 8 часов, только чтение тега релиза на GitHub.")
-                    .size(10.5)
-                    .color(HINT),
-            );
-        });
-        check
-    }
+                ui.add_space(4.0);
+            }
 
-    fn system_card(&mut self, ui: &mut egui::Ui) {
-        card(ui, "СИСТЕМА", |ui| {
             let mut a = self.autostart;
             if ui
                 .checkbox(&mut a, "Автозапуск при входе (ярлык в Startup)")
@@ -436,6 +427,49 @@ impl App {
             if ui.button("Показать файл журнала").clicked() {
                 reveal_log();
             }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            let (checked, available, failed) = {
+                let st = self.shared.update.lock().unwrap();
+                (st.checked, st.available.clone(), st.error.is_some())
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("Quotty {}", crate::update::current()))
+                        .size(12.0)
+                        .color(TEXT),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (text, col) = match (&available, checked, failed) {
+                        (Some(u), _, _) => (format!("доступна {}", u.version), WARN),
+                        (None, true, false) => ("актуальная версия".to_string(), ACCENT),
+                        (None, true, true) => ("проверка не удалась".to_string(), HINT),
+                        _ => ("проверка…".to_string(), HINT),
+                    };
+                    ui.label(RichText::new(text).size(11.0).color(col));
+                });
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Проверить обновления").clicked() {
+                    *check_update = true;
+                }
+                if let Some(u) = &available {
+                    ui.hyperlink_to(
+                        RichText::new("Открыть страницу релиза")
+                            .size(11.5)
+                            .color(ACCENT),
+                        u.url.clone(),
+                    );
+                }
+            });
+            ui.label(
+                RichText::new("Проверка раз в 8 часов, только чтение тега релиза на GitHub.")
+                    .size(10.5)
+                    .color(HINT),
+            );
         });
     }
 }
@@ -512,12 +546,25 @@ fn close_button(ui: &mut egui::Ui) -> bool {
     }
     let c = rect.center();
     let r = 4.5;
-    let s = Stroke::new(1.6, col);
+    let s = Stroke::new(1.6_f32, col);
     ui.painter()
         .line_segment([c + Vec2::new(-r, -r), c + Vec2::new(r, r)], s);
     ui.painter()
         .line_segment([c + Vec2::new(r, -r), c + Vec2::new(-r, r)], s);
     resp.clicked()
+}
+
+/// Open Explorer on a folder.
+fn reveal_path(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(path.as_os_str())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
 }
 
 /// Open Explorer on the log file (or its folder, when nothing has been logged).

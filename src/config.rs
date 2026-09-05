@@ -29,6 +29,7 @@ pub enum ActiveMode {
 pub struct Settings {
     /// Window opacity, 0.15..=1.0
     pub opacity: f32,
+    pub language: crate::i18n::Language,
     /// Last window position (screen points). None = let the OS place it.
     pub pos: Option<(f32, f32)>,
     /// Poll interval in seconds.
@@ -51,6 +52,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             opacity: 0.8,
+            language: crate::i18n::Language::default(),
             pos: None,
             poll_secs: 60,
             animate: true,
@@ -190,5 +192,32 @@ impl Settings {
             .into_iter()
             .filter(|f| self.enabled(*f))
             .fold(0u8, |m, f| m | (1 << f.idx()))
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::*;
+    use crate::i18n::Language;
+    #[test]
+    fn existing_settings_default_to_russian_and_keep_display_preferences() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"opacity":0.5,"header_mode":"Hidden"}"#).unwrap();
+        assert_eq!(settings.language, Language::Russian);
+        assert_eq!(settings.opacity, 0.5);
+        assert_eq!(settings.header_mode, HeaderMode::Hidden);
+    }
+    #[test]
+    fn switching_language_preserves_every_other_saved_field() {
+        let mut settings = Settings::default();
+        let mut before = serde_json::to_value(&settings).unwrap();
+        settings.language = Language::English;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.language, Language::English);
+        let mut after = serde_json::to_value(restored).unwrap();
+        before.as_object_mut().unwrap().remove("language");
+        after.as_object_mut().unwrap().remove("language");
+        assert_eq!(before, after);
     }
 }

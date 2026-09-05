@@ -2,6 +2,7 @@
 
 use crate::active;
 use crate::config::{ActiveMode, HeaderMode, Settings};
+use crate::i18n::{tr_format, Language};
 use crate::providers::{self, Family, Snapshot};
 use crate::shortcuts;
 use crate::tray::Tray;
@@ -74,7 +75,7 @@ pub struct App {
     applied_h: f32,
     /// Cached "Resets …" strings, refreshed at most once per second.
     reset_cache: Vec<Option<(String, String)>>,
-    reset_cache_sec: i64,
+    pub(crate) reset_cache_sec: i64,
     /// Throttle for persisting the auto-switched family.
     last_family_save: f64,
     /// Tray menu events, delivered via a handler that also wakes the UI so
@@ -210,7 +211,7 @@ impl App {
         spawn_update_checker(shared.clone(), cc.egui_ctx.clone());
 
         let autostart = shortcuts::is_autostart_enabled();
-        let tray = Tray::new(autostart).ok();
+        let tray = Tray::new(autostart, settings.language).ok();
 
         // Route tray menu events through our own channel and wake the UI on each
         // one, so a menu choice is applied immediately instead of on the next
@@ -308,6 +309,7 @@ impl App {
     }
 
     fn draw_strip(&mut self, ui: &mut egui::Ui, anim_t: f64, animate: bool) {
+        let lang = self.settings.language;
         let op = self.settings.opacity;
         let full = ui.max_rect();
         let painter = ui.painter().clone();
@@ -358,22 +360,22 @@ impl App {
             );
         }
         let (status, status_col, dot) = if !ever && !online {
-            ("загрузка…", dim, false)
+            (lang.text("загрузка…", "loading…"), dim, false)
         } else if online {
             (
-                "онлайн",
+                lang.text("онлайн", "online"),
                 Color32::from_rgba_unmultiplied(120, 205, 150, text_a),
                 true,
             )
         } else if stale {
             (
-                "подключение",
+                lang.text("подключение", "connecting"),
                 Color32::from_rgba_unmultiplied(214, 200, 110, text_a),
                 true,
             )
         } else {
             (
-                "оффлайн",
+                lang.text("оффлайн", "offline"),
                 Color32::from_rgba_unmultiplied(232, 150, 80, text_a),
                 true,
             )
@@ -410,7 +412,7 @@ impl App {
                 self.reset_cache = s
                     .limits
                     .iter()
-                    .map(|l| l.window.map(|w| fmt_reset(w.resets_at, now)))
+                    .map(|l| l.window.map(|w| fmt_reset(w.resets_at, now, lang)))
                     .collect();
                 self.reset_cache_sec = sec;
             }
@@ -432,6 +434,7 @@ impl App {
                     animate,
                     anim_t,
                     i,
+                    lang,
                 );
                 y += 34.0;
             }
@@ -439,7 +442,7 @@ impl App {
             painter.text(
                 Pos2::new(left, y),
                 Align2::LEFT_TOP,
-                "нет данных",
+                lang.text("нет данных", "no data"),
                 FontId::proportional(11.0),
                 dim,
             );
@@ -448,7 +451,7 @@ impl App {
             painter.text(
                 Pos2::new(left, y),
                 Align2::LEFT_TOP,
-                format!("ошибка: {e}"),
+                tr_format!(lang, "ошибка: {e}", "error: {e}"),
                 FontId::proportional(10.5),
                 Color32::from_rgba_unmultiplied(232, 150, 80, text_a),
             );
@@ -458,9 +461,12 @@ impl App {
     /// Announce a pending update on the tray icon, where it can be seen without
     /// opening anything.
     fn sync_tooltip(&mut self) {
+        let lang = self.settings.language;
         let want = match &self.shared.update.lock().unwrap().available {
-            Some(u) => format!(
+            Some(u) => tr_format!(
+                lang,
                 "Quotty {} — доступно обновление {}",
+                "Quotty {} — update {} available",
                 update::current(),
                 u.version
             ),
@@ -596,6 +602,7 @@ fn draw_limit(
     animate: bool,
     anim_t: f64,
     idx: usize,
+    lang: Language,
 ) {
     {
         // No window at all (the service has not opened one) → no clock: no time
@@ -619,13 +626,15 @@ fn draw_limit(
         painter.text(
             Pos2::new(left, y),
             Align2::LEFT_TOP,
-            &lim.title,
+            lang.limit_title(&lim.title),
             FontId::proportional(12.5),
             strong,
         );
         let reset_text = match reset {
-            Some((abs, rel)) => format!("Resets {abs} · {rel}"),
-            None => "окно ещё не начато".to_string(),
+            Some((abs, rel)) => tr_format!(lang, "Сброс {abs} · {rel}", "Resets {abs} · {rel}"),
+            None => lang
+                .text("окно ещё не начато", "window has not started")
+                .to_string(),
         };
         let reset_rect = painter.text(
             Pos2::new(right, y + 1.0),
@@ -863,29 +872,29 @@ fn draw_bubbles(
     }
 }
 
-fn fmt_reset(reset: DateTime<Utc>, now: DateTime<Utc>) -> (String, String) {
+fn fmt_reset(reset: DateTime<Utc>, now: DateTime<Utc>, lang: Language) -> (String, String) {
     let local = reset.with_timezone(&Local);
     let rem = reset - now;
     let abs = if rem > Duration::hours(24) {
-        local.format("%a %H:%M").to_string()
+        local.format("%d.%m %H:%M").to_string()
     } else {
         local.format("%H:%M").to_string()
     };
     let mins = rem.num_minutes().max(0);
     let rel = if mins >= 1440 {
-        format!("{}d {}h", mins / 1440, (mins % 1440) / 60)
+        tr_format!(lang, "{}д {}ч", "{}d {}h", mins / 1440, (mins % 1440) / 60)
     } else if mins >= 60 {
-        format!("{}h {}m", mins / 60, mins % 60)
+        tr_format!(lang, "{}ч {}м", "{}h {}m", mins / 60, mins % 60)
     } else if rem > Duration::zero() {
         // "0m" read as "already reset" while the quota was still counting.
         if mins == 0 {
-            "<1m".to_string()
+            lang.text("<1м", "<1m").to_string()
         } else {
-            format!("{mins}m")
+            tr_format!(lang, "{mins}м", "{mins}m")
         }
     } else {
         // The clock ran out; the next poll brings the new window.
-        "обновление…".to_string()
+        lang.text("обновление…", "refreshing…").to_string()
     };
     (abs, rel)
 }
@@ -1013,12 +1022,19 @@ mod tests {
     #[test]
     fn the_last_minute_is_not_zero_minutes() {
         let now = Utc::now();
-        let rel = |secs: i64| fmt_reset(now + Duration::seconds(secs), now).1;
+        let rel = |secs: i64| {
+            fmt_reset(
+                now + Duration::seconds(secs),
+                now,
+                crate::i18n::Language::Russian,
+            )
+            .1
+        };
 
-        assert_eq!(rel(40), "<1m", "under a minute still has time left");
-        assert_eq!(rel(95), "1m");
-        assert_eq!(rel(2 * 3600 + 5 * 60), "2h 5m");
-        assert_eq!(rel(25 * 3600), "1d 1h");
+        assert_eq!(rel(40), "<1м", "under a minute still has time left");
+        assert_eq!(rel(95), "1м");
+        assert_eq!(rel(2 * 3600 + 5 * 60), "2ч 5м");
+        assert_eq!(rel(25 * 3600), "1д 1ч");
         assert_eq!(rel(0), "обновление…", "the clock ran out, wait for a poll");
         assert_eq!(rel(-30), "обновление…");
     }

@@ -1,7 +1,7 @@
 //! The Quotty window (a compact, movable, translucent strip) plus tray wiring.
 
 use crate::active;
-use crate::config::{ActiveMode, HeaderMode, Settings};
+use crate::config::{ActiveMode, HeaderMode, Settings, StripSize};
 use crate::providers::{self, Family, Snapshot};
 use crate::shortcuts;
 use crate::tray::Tray;
@@ -39,6 +39,188 @@ struct ActiveState {
 /// `want`/`enabled` sentinel: no family singled out for an immediate poll.
 const NO_FAMILY: u8 = 0xFF;
 
+/// How much of the reset time a design has room for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResetStyle {
+    /// "Resets 14:05 · 2h 5m"
+    Full,
+    /// "2h 5m"
+    Rel,
+    /// "2h"
+    Tiny,
+}
+
+impl ResetStyle {
+    fn render(self, (abs, rel, tiny): &(String, String, String)) -> String {
+        match self {
+            ResetStyle::Full => format!("Resets {abs} · {rel}"),
+            ResetStyle::Rel => rel.clone(),
+            ResetStyle::Tiny => tiny.clone(),
+        }
+    }
+}
+
+/// Every number one strip design is made of. The three designs differ only in
+/// these values plus `inline`, so the drawing code below is written once.
+struct Metrics {
+    /// Stacked design only: the window's width. The inline ones derive theirs
+    /// from the columns (`Metrics::width`).
+    fixed_w: f32,
+    pad_x: f32,
+    pad_top: f32,
+    pad_bottom: f32,
+    /// Height of the header/status line (always drawn — the status word lives
+    /// there even when the header text is switched off).
+    header_h: f32,
+    header_font: f32,
+    status_font: f32,
+    dot_r: f32,
+    /// Vertical stride of one limit row.
+    row_h: f32,
+    /// Where the bar sits inside its row.
+    bar_dy: f32,
+    bar_h: f32,
+    title_font: f32,
+    pct_font: f32,
+    reset_font: f32,
+    /// Title and numbers sit *beside* the bar instead of above it.
+    inline: bool,
+    /// Inline only: is there a (short) title column left of the bar? Its width
+    /// is measured from the titles actually on screen, not fixed here.
+    titles: bool,
+    /// Inline only: the bar's own length — the window is sized around it.
+    bar_w: f32,
+    /// Inline only: column reserved right of the bar for percent + countdown.
+    text_w: f32,
+    reset_style: ResetStyle,
+    /// Stands in for the countdown before the service opens the window.
+    no_window: &'static str,
+    round: f32,
+    bar_round: f32,
+}
+
+impl Metrics {
+    /// Window width. The stacked design has a fixed one and spreads the bar
+    /// across it; the inline ones are exactly their columns wide, so a short
+    /// title column (Claude's "5h"/"7d") pulls the right edge in with it.
+    fn width(&self, title_w: f32) -> f32 {
+        if self.inline {
+            2.0 * self.pad_x + title_w + self.bar_w + self.text_w
+        } else {
+            self.fixed_w
+        }
+    }
+}
+
+impl StripSize {
+    fn metrics(self) -> Metrics {
+        match self {
+            StripSize::Normal => Metrics {
+                fixed_w: 386.0,
+                pad_x: 7.0,
+                // Both are smaller than `pad_x` on purpose, so that all four
+                // margins *measure* 7 px on screen: the header's glyphs start
+                // ~4 px below the top of their text box, and the last row's
+                // trailing space (row_h - bar_dy - bar_h) already sits under
+                // the bottom bar.
+                pad_top: 3.0,
+                pad_bottom: 5.0,
+                header_h: 18.0,
+                header_font: 12.5,
+                status_font: 11.5,
+                dot_r: 3.2,
+                row_h: 33.0,
+                bar_dy: 17.0,
+                bar_h: 13.0,
+                title_font: 12.5,
+                pct_font: 12.5,
+                reset_font: 12.0,
+                inline: false,
+                titles: true,
+                bar_w: 0.0,
+                text_w: 0.0,
+                reset_style: ResetStyle::Full,
+                no_window: "окно ещё не начато",
+                round: 8.0,
+                bar_round: 4.5,
+            },
+            StripSize::Mini => Metrics {
+                fixed_w: 0.0,
+                pad_x: 8.0,
+                pad_top: 6.0,
+                pad_bottom: 5.0,
+                header_h: 16.0,
+                header_font: 11.5,
+                status_font: 10.5,
+                dot_r: 2.8,
+                row_h: 21.0,
+                bar_dy: 4.5,
+                bar_h: 12.0,
+                title_font: 11.0,
+                pct_font: 12.0,
+                reset_font: 11.0,
+                inline: true,
+                titles: true,
+                bar_w: 174.0,
+                text_w: 74.0,
+                reset_style: ResetStyle::Rel,
+                no_window: "не начато",
+                round: 7.0,
+                bar_round: 4.0,
+            },
+            StripSize::Nano => Metrics {
+                fixed_w: 0.0,
+                pad_x: 6.0,
+                pad_top: 5.0,
+                pad_bottom: 4.0,
+                header_h: 14.0,
+                header_font: 10.5,
+                status_font: 10.0,
+                dot_r: 2.4,
+                row_h: 15.0,
+                bar_dy: 3.0,
+                bar_h: 9.0,
+                title_font: 10.5,
+                pct_font: 11.0,
+                reset_font: 10.5,
+                inline: true,
+                titles: false,
+                bar_w: 148.0,
+                text_w: 54.0,
+                reset_style: ResetStyle::Tiny,
+                no_window: "—",
+                round: 6.0,
+                bar_round: 3.5,
+            },
+        }
+    }
+}
+
+/// The text colours and the alpha every strip colour is built from — all a
+/// function of the opacity setting alone.
+struct Palette {
+    op: f32,
+    text_a: u8,
+    dim: Color32,
+    /// Between `dim` and `strong`: the countdown on the small designs, where
+    /// `dim` at that size was hard to read.
+    mid: Color32,
+    strong: Color32,
+}
+
+impl Palette {
+    fn new(op: f32) -> Self {
+        let text_a = ((0.35 + 0.65 * op) * 255.0) as u8;
+        Self {
+            op,
+            text_a,
+            dim: Color32::from_rgba_unmultiplied(190, 196, 210, text_a),
+            mid: Color32::from_rgba_unmultiplied(214, 220, 233, text_a),
+            strong: Color32::from_rgba_unmultiplied(232, 236, 245, text_a),
+        }
+    }
+}
+
 pub struct Shared {
     /// One state per family, indexed by `Family::idx`.
     pub states: Mutex<Vec<FetchState>>,
@@ -64,16 +246,25 @@ pub struct App {
     pub(crate) settings_center: bool,
     /// Work area of that monitor, captured when the window was opened.
     pub(crate) settings_area: Option<(i32, i32, i32, i32)>,
+    /// The settings window itself, resolved once it exists (see
+    /// `own_settings_window`); it is ours to move and to re-chrome.
+    pub(crate) settings_hwnd: Option<isize>,
     /// Height the settings window is currently sized to (fitted to content).
     pub(crate) settings_h: f32,
     pub(crate) autostart: bool,
     /// Family currently on screen.
     pub(crate) active: Family,
     detector: active::Detector,
-    /// Height we last asked the OS for, so we only resize when it changes.
-    applied_h: f32,
+    /// Size we last asked the OS for, so we only resize when it changes.
+    applied_size: Vec2,
+    /// Width of the inline designs' title column, measured once a frame from
+    /// the titles actually on screen (`Metrics::width`).
+    title_w: f32,
+    /// Nothing to watch: the strip is still there, but paints nothing and lets
+    /// clicks through (see `set_click_through`).
+    idle_hidden: bool,
     /// Cached "Resets …" strings, refreshed at most once per second.
-    reset_cache: Vec<Option<(String, String)>>,
+    reset_cache: Vec<Option<(String, String, String)>>,
     reset_cache_sec: i64,
     /// Throttle for persisting the auto-switched family.
     last_family_save: f64,
@@ -230,10 +421,13 @@ impl App {
             show_settings: false,
             settings_center: false,
             settings_area: None,
+            settings_hwnd: None,
             settings_h: 640.0,
             autostart,
             detector: active::Detector::default(),
-            applied_h: 0.0,
+            applied_size: Vec2::ZERO,
+            title_w: 0.0,
+            idle_hidden: false,
             reset_cache: Vec::new(),
             reset_cache_sec: 0,
             last_family_save: f64::MIN,
@@ -307,7 +501,31 @@ impl App {
         }
     }
 
+    /// Take the strip off the screen while none of the enabled tools is even
+    /// running: with nothing spending quota there is nothing to watch.
+    ///
+    /// The window itself stays — the event loop, the tray and the settings
+    /// window all live inside its message pump, and a hidden window gets no
+    /// `WM_PAINT`, so hiding it for real would stop the app dead. Instead it
+    /// paints nothing (the window is transparent, so that leaves nothing to
+    /// see) and drops out of mouse hit-testing, so its rectangle cannot swallow
+    /// clicks meant for whatever is underneath.
+    fn update_visibility(&mut self, ctx: &egui::Context, t: f64) {
+        // While the settings window is open the strip stays up whatever is
+        // running: that is where the user changes the design and the toggle
+        // below, and both would otherwise be invisible.
+        let hide = self.settings.hide_when_idle
+            && !self.show_settings
+            && self.detector.running(t) & self.settings.enabled_mask() == 0;
+        if hide == self.idle_hidden {
+            return;
+        }
+        self.idle_hidden = hide;
+        ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(hide));
+    }
+
     fn draw_strip(&mut self, ui: &mut egui::Ui, anim_t: f64, animate: bool) {
+        let m = self.settings.strip_size.metrics();
         let op = self.settings.opacity;
         let full = ui.max_rect();
         let painter = ui.painter().clone();
@@ -316,17 +534,16 @@ impl App {
         // a stray fringe on the transparent window corners).
         painter.rect_filled(
             full,
-            egui::Rounding::same(8.0),
+            egui::Rounding::same(m.round),
             Color32::from_rgba_unmultiplied(22, 24, 30, (op * 235.0) as u8),
         );
 
-        let text_a = ((0.35 + 0.65 * op) * 255.0) as u8;
-        let dim = Color32::from_rgba_unmultiplied(190, 196, 210, text_a);
-        let strong = Color32::from_rgba_unmultiplied(232, 236, 245, text_a);
+        let pal = Palette::new(op);
+        let (text_a, dim) = (pal.text_a, pal.dim);
 
-        let left = full.left() + 12.0;
-        let right = full.right() - 12.0;
-        let mut y = full.top() + 8.0;
+        let left = full.left() + m.pad_x;
+        let right = full.right() - m.pad_x;
+        let mut y = full.top() + m.pad_top;
 
         let now = Utc::now();
         let ActiveState {
@@ -348,15 +565,6 @@ impl App {
                 .map(|s| s.plan.clone())
                 .unwrap_or_else(|| self.active.name().to_string()),
         };
-        if !header.is_empty() {
-            painter.text(
-                Pos2::new(left, y),
-                Align2::LEFT_TOP,
-                header,
-                FontId::proportional(11.5),
-                strong,
-            );
-        }
         let (status, status_col, dot) = if !ever && !online {
             ("загрузка…", dim, false)
         } else if online {
@@ -382,9 +590,24 @@ impl App {
             Pos2::new(right, y),
             Align2::RIGHT_TOP,
             status,
-            FontId::proportional(10.5),
+            FontId::proportional(m.status_font),
             status_col,
         );
+        // The header goes on after the status word, clipped to the room left of
+        // it: on the narrow designs a long plan name would otherwise run into it.
+        if !header.is_empty() {
+            let room = Rect::from_min_max(
+                Pos2::new(left, y - 2.0),
+                Pos2::new(status_rect.left() - 12.0, y + m.header_h),
+            );
+            painter.with_clip_rect(room).text(
+                Pos2::new(left, y),
+                Align2::LEFT_TOP,
+                header,
+                FontId::proportional(m.header_font),
+                pal.strong,
+            );
+        }
         if dot {
             // While throttled the dot breathes, so "подключение" reads as
             // something still trying rather than something stuck.
@@ -396,11 +619,11 @@ impl App {
             };
             painter.circle_filled(
                 Pos2::new(status_rect.left() - 6.0, status_rect.center().y),
-                3.0,
+                m.dot_r,
                 col,
             );
         }
-        y += 17.0;
+        y += m.header_h;
 
         if let Some(s) = &last {
             // Reset-time strings change at most once a second — cache them so
@@ -424,32 +647,32 @@ impl App {
                     right,
                     y,
                     now,
-                    op,
-                    text_a,
-                    dim,
-                    strong,
+                    &m,
+                    self.title_w,
+                    &pal,
                     show_values,
                     animate,
                     anim_t,
                     i,
                 );
-                y += 34.0;
+                y += m.row_h;
             }
         } else if !online && ever {
             painter.text(
                 Pos2::new(left, y),
                 Align2::LEFT_TOP,
                 "нет данных",
-                FontId::proportional(11.0),
+                FontId::proportional(m.reset_font),
                 dim,
             );
         } else if let Some(e) = &err {
             // Never got data and failing — surface the reason.
-            painter.text(
+            let room = Rect::from_min_max(Pos2::new(left, y), Pos2::new(right, full.bottom()));
+            painter.with_clip_rect(room).text(
                 Pos2::new(left, y),
                 Align2::LEFT_TOP,
                 format!("ошибка: {e}"),
-                FontId::proportional(10.5),
+                FontId::proportional(m.reset_font),
                 Color32::from_rgba_unmultiplied(232, 150, 80, text_a),
             );
         }
@@ -583,20 +806,22 @@ fn spawn_update_checker(shared: Arc<Shared>, ctx: egui::Context) {
 fn draw_limit(
     painter: &egui::Painter,
     lim: &providers::Limit,
-    reset: Option<&(String, String)>,
+    reset: Option<&(String, String, String)>,
     left: f32,
     right: f32,
     y: f32,
     now: DateTime<Utc>,
-    op: f32,
-    text_a: u8,
-    dim: Color32,
-    strong: Color32,
+    m: &Metrics,
+    // Inline designs: width of the title column, measured from the titles on
+    // screen so the bar starts right after the widest of them.
+    title_w: f32,
+    pal: &Palette,
     show_values: bool,
     animate: bool,
     anim_t: f64,
     idx: usize,
 ) {
+    let (op, text_a) = (pal.op, pal.text_a);
     {
         // No window at all (the service has not opened one) → no clock: no time
         // marker, no pace colours, no bubbles. A window whose start we could not
@@ -615,25 +840,10 @@ fn draw_limit(
         let exhausted = lim.used_percent >= LIMIT_PCT;
         let overspend = show && !exhausted && time_frac.is_some_and(|t| use_frac > t + 0.02);
 
-        // Title line: name (left) + reset time (far right) + used% (left of it).
-        painter.text(
-            Pos2::new(left, y),
-            Align2::LEFT_TOP,
-            &lim.title,
-            FontId::proportional(12.5),
-            strong,
-        );
         let reset_text = match reset {
-            Some((abs, rel)) => format!("Resets {abs} · {rel}"),
-            None => "окно ещё не начато".to_string(),
+            Some(r) => m.reset_style.render(r),
+            None => m.no_window.to_string(),
         };
-        let reset_rect = painter.text(
-            Pos2::new(right, y + 1.0),
-            Align2::RIGHT_TOP,
-            reset_text,
-            FontId::proportional(11.0),
-            dim,
-        );
         let pct_text = if show {
             format!("{:.0}%", lim.used_percent)
         } else {
@@ -644,25 +854,79 @@ fn draw_limit(
         } else {
             spend_text_color(exhausted, overspend, text_a)
         };
-        painter.text(
-            Pos2::new(reset_rect.left() - 12.0, y),
-            Align2::RIGHT_TOP,
-            pct_text,
-            FontId::proportional(12.5),
-            pct_col,
-        );
+
+        // The bar keeps the whole row's width in the stacked design; in the
+        // small ones it gives up a column on each side to the text beside it.
+        let ub_y = y + m.bar_dy;
+        let ub_h = m.bar_h;
+        let (bar_l, bar_r) = if m.inline {
+            (left + title_w, right - m.text_w)
+        } else {
+            (left, right)
+        };
+        let yc = ub_y + ub_h / 2.0;
+
+        if m.inline {
+            // One line: [short title] [bar] [used%] [countdown].
+            if m.titles {
+                let room =
+                    Rect::from_min_max(Pos2::new(left, y), Pos2::new(bar_l - 4.0, y + m.row_h));
+                painter.with_clip_rect(room).text(
+                    Pos2::new(left, yc),
+                    Align2::LEFT_CENTER,
+                    short_title(&lim.title),
+                    FontId::proportional(m.title_font),
+                    pal.strong,
+                );
+            }
+            let reset_rect = painter.text(
+                Pos2::new(right, yc),
+                Align2::RIGHT_CENTER,
+                reset_text,
+                FontId::proportional(m.reset_font),
+                pal.mid,
+            );
+            painter.text(
+                Pos2::new(reset_rect.left() - 6.0, yc),
+                Align2::RIGHT_CENTER,
+                pct_text,
+                FontId::proportional(m.pct_font),
+                pct_col,
+            );
+        } else {
+            // Title line: name (left) + reset time (far right) + used% (left of it).
+            painter.text(
+                Pos2::new(left, y),
+                Align2::LEFT_TOP,
+                &lim.title,
+                FontId::proportional(m.title_font),
+                pal.strong,
+            );
+            let reset_rect = painter.text(
+                Pos2::new(right, y + 0.5),
+                Align2::RIGHT_TOP,
+                reset_text,
+                FontId::proportional(m.reset_font),
+                pal.mid,
+            );
+            painter.text(
+                Pos2::new(reset_rect.left() - 12.0, y),
+                Align2::RIGHT_TOP,
+                pct_text,
+                FontId::proportional(m.pct_font),
+                pct_col,
+            );
+        }
 
         // Single usage bar.
         let track_col = Color32::from_rgba_unmultiplied(60, 64, 76, (op * 220.0) as u8);
-        let full_w = right - left;
-        let ub_y = y + 18.0;
-        let ub_h = 11.0;
-        let yc = ub_y + ub_h / 2.0;
-        let ub_track = Rect::from_min_max(Pos2::new(left, ub_y), Pos2::new(right, ub_y + ub_h));
-        painter.rect_filled(ub_track, egui::Rounding::same(4.0), track_col);
+        let full_w = bar_r - bar_l;
+        let round = egui::Rounding::same(m.bar_round);
+        let ub_track = Rect::from_min_max(Pos2::new(bar_l, ub_y), Pos2::new(bar_r, ub_y + ub_h));
+        painter.rect_filled(ub_track, round, track_col);
 
         // Where the time marker sits — nowhere, when the window has no clock.
-        let marker_x = time_frac.map(|t| left + full_w * t);
+        let marker_x = time_frac.map(|t| bar_l + full_w * t);
 
         let green =
             Color32::from_rgba_unmultiplied(96, 196, 132, ((0.55 + 0.45 * op) * 255.0) as u8);
@@ -672,30 +936,30 @@ fn draw_limit(
             Color32::from_rgba_unmultiplied(214, 150, 74, ((0.55 + 0.45 * op) * 255.0) as u8);
 
         if show {
-            let use_end = left + full_w * use_frac;
+            let use_end = bar_l + full_w * use_frac;
             if exhausted {
                 // Quota gone → the whole bar is dim-orange.
-                painter.rect_filled(ub_track, egui::Rounding::same(4.0), orange);
+                painter.rect_filled(ub_track, round, orange);
             } else if let Some(mx) = marker_x.filter(|_| overspend) {
                 // Green up to the time marker, dim-yellow for the overspend
                 // (marker → spend edge). No bubbles.
                 painter.rect_filled(
                     Rect::from_min_max(ub_track.min, Pos2::new(mx, ub_y + ub_h)),
-                    egui::Rounding::same(4.0),
+                    round,
                     green,
                 );
                 painter.rect_filled(
                     Rect::from_min_max(Pos2::new(mx, ub_y), Pos2::new(use_end, ub_y + ub_h)),
-                    egui::Rounding::same(4.0),
+                    round,
                     yellow,
                 );
             } else {
                 // Under pace: green fill up to spend edge, with bubbles rising
                 // out of the spend edge and dissolving just to its right.
-                let ub_fill_w = (use_end - left).max(if use_frac > 0.0 { 3.0 } else { 0.0 });
+                let ub_fill_w = (use_end - bar_l).max(if use_frac > 0.0 { 3.0 } else { 0.0 });
                 painter.rect_filled(
                     Rect::from_min_size(ub_track.min, Vec2::new(ub_fill_w, ub_h)),
-                    egui::Rounding::same(4.0),
+                    round,
                     green,
                 );
                 if let Some(mx) = marker_x.filter(|mx| animate && *mx > use_end + 4.0) {
@@ -717,8 +981,8 @@ fn draw_limit(
             // Offline: spend unknown → grey "flow" across the whole bar.
             draw_bubbles(
                 painter,
-                left + 2.0,
-                right - 2.0,
+                bar_l + 2.0,
+                bar_r - 2.0,
                 yc,
                 anim_t,
                 (170, 175, 186),
@@ -730,8 +994,8 @@ fn draw_limit(
         } else {
             // Offline, animation off → a static grey placeholder fill.
             painter.rect_filled(
-                Rect::from_min_max(Pos2::new(left, ub_y), Pos2::new(right, ub_y + ub_h)),
-                egui::Rounding::same(4.0),
+                ub_track,
+                round,
                 Color32::from_rgba_unmultiplied(96, 100, 110, (op * 200.0) as u8),
             );
         }
@@ -747,6 +1011,25 @@ fn draw_limit(
                 Color32::from_rgba_unmultiplied(235, 238, 245, ((0.55 + 0.45 * op) * 255.0) as u8),
             );
         }
+    }
+}
+
+/// A row title cut down to the couple of characters the small designs have room
+/// for: "5-hour limit" → "5h", "Weekly · all models" → "7d", "Claude / GPT" →
+/// "Claude". Anything unrecognised keeps its first word.
+fn short_title(title: &str) -> String {
+    let head = title.split('·').next().unwrap_or(title).trim();
+    let low = head.to_ascii_lowercase();
+    if let Some(n) = low.strip_suffix("-hour limit") {
+        return format!("{n}h");
+    }
+    if let Some(n) = low.strip_suffix("-day limit") {
+        return format!("{n}d");
+    }
+    match low.as_str() {
+        "weekly" => "7d".to_string(),
+        "monthly limit" => "30d".to_string(),
+        _ => head.split_whitespace().next().unwrap_or(head).to_string(),
     }
 }
 
@@ -863,7 +1146,10 @@ fn draw_bubbles(
     }
 }
 
-fn fmt_reset(reset: DateTime<Utc>, now: DateTime<Utc>) -> (String, String) {
+/// The three ways one reset time gets written, longest first: the clock time,
+/// the countdown, and the countdown's leading unit alone (all a small design
+/// has room for).
+fn fmt_reset(reset: DateTime<Utc>, now: DateTime<Utc>) -> (String, String, String) {
     let local = reset.with_timezone(&Local);
     let rem = reset - now;
     let abs = if rem > Duration::hours(24) {
@@ -872,22 +1158,29 @@ fn fmt_reset(reset: DateTime<Utc>, now: DateTime<Utc>) -> (String, String) {
         local.format("%H:%M").to_string()
     };
     let mins = rem.num_minutes().max(0);
-    let rel = if mins >= 1440 {
-        format!("{}d {}h", mins / 1440, (mins % 1440) / 60)
+    let (rel, tiny) = if mins >= 1440 {
+        (
+            format!("{}d {}h", mins / 1440, (mins % 1440) / 60),
+            format!("{}d", mins / 1440),
+        )
     } else if mins >= 60 {
-        format!("{}h {}m", mins / 60, mins % 60)
+        (
+            format!("{}h {}m", mins / 60, mins % 60),
+            format!("{}h", mins / 60),
+        )
     } else if rem > Duration::zero() {
         // "0m" read as "already reset" while the quota was still counting.
-        if mins == 0 {
+        let s = if mins == 0 {
             "<1m".to_string()
         } else {
             format!("{mins}m")
-        }
+        };
+        (s.clone(), s)
     } else {
         // The clock ran out; the next poll brings the new window.
-        "обновление…".to_string()
+        ("обновление…".to_string(), "…".to_string())
     };
-    (abs, rel)
+    (abs, rel, tiny)
 }
 
 impl eframe::App for App {
@@ -897,17 +1190,26 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         LAST_PAINT_MS.store(uptime_ms(), Ordering::Relaxed);
+        if self.hwnd.is_none() {
+            self.hwnd = native_hwnd(frame);
+        }
         self.handle_tray_events(ctx);
 
         let anim_t = ctx.input(|i| i.time);
         self.update_active(anim_t);
+        self.update_visibility(ctx, anim_t);
 
         // Snapshot animation-relevant state under one lock.
         let animate_on = self.settings.animate;
-        let (n_limits, animating) = {
+        let (n_limits, animating, titles) = {
             let st = self.shared.states.lock().unwrap();
             let s = &st[self.active.idx()];
             let n = s.last.as_ref().map(|s| s.limits.len().max(1)).unwrap_or(2);
+            let titles: Vec<String> = s
+                .last
+                .as_ref()
+                .map(|s| s.limits.iter().map(|l| short_title(&l.title)).collect())
+                .unwrap_or_default();
             // Animate (when enabled) whenever offline, or online with a gap.
             let stale = !s.online && s.rate_limited && s.last.is_some();
             let anim = if stale {
@@ -930,15 +1232,44 @@ impl eframe::App for App {
             } else {
                 false
             };
-            (n, anim)
+            (n, anim, titles)
         };
 
-        // Fit the window height to the number of limits — which changes when the
-        // active family does (Claude has two windows, Antigravity three).
-        let want_h = 8.0 + 17.0 + n_limits as f32 * 34.0 + 6.0;
-        if (want_h - self.applied_h).abs() > 0.5 {
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(430.0, want_h)));
-            self.applied_h = want_h;
+        // Fit the window to the design and to the number of limits — which
+        // changes when the active family does (Claude has two windows,
+        // Antigravity three). On the inline designs the width follows the
+        // titles too: "5h"/"7d" needs a far narrower column than "Gemini", and
+        // the window should not carry that gap around for nothing.
+        let m = self.settings.strip_size.metrics();
+        self.title_w = if m.inline && m.titles {
+            let font = egui::FontId::proportional(m.title_font);
+            let widest = ctx.fonts(|f| {
+                titles
+                    .iter()
+                    .map(|t| {
+                        f.layout_no_wrap(t.clone(), font.clone(), Color32::WHITE)
+                            .size()
+                            .x
+                    })
+                    .fold(0.0f32, f32::max)
+            });
+            // Before the first snapshot there is nothing to measure; a sane
+            // guess keeps the window from jumping much when data lands.
+            if widest > 0.0 {
+                widest + 6.0
+            } else {
+                24.0
+            }
+        } else {
+            0.0
+        };
+        let want = Vec2::new(
+            m.width(self.title_w),
+            m.pad_top + m.header_h + n_limits as f32 * m.row_h + m.pad_bottom,
+        );
+        if (want - self.applied_size).length() > 0.5 {
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
+            self.applied_size = want;
         }
 
         // Re-assert always-on-top periodically: the taskbar is topmost too and
@@ -946,10 +1277,7 @@ impl eframe::App for App {
         // egui/winit (`ViewportCommand::WindowLevel`) does NOT work — winit
         // diffs window flags and returns early when the level is unchanged, so
         // no SetWindowPos is issued. We must call Win32 directly.
-        if anim_t - self.last_topmost >= 0.7 {
-            if self.hwnd.is_none() {
-                self.hwnd = native_hwnd(frame);
-            }
+        if !self.idle_hidden && anim_t - self.last_topmost >= 0.7 {
             if let Some(h) = self.hwnd {
                 force_topmost(h);
             }
@@ -959,6 +1287,11 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
+                // Hidden: paint nothing (the window is transparent, so it leaves
+                // no trace) and take no input either.
+                if self.idle_hidden {
+                    return;
+                }
                 let full = ui.max_rect();
                 let resp = ui.interact(full, ui.id().with("strip-drag"), Sense::click_and_drag());
                 if resp.drag_started_by(PointerButton::Primary) {
@@ -992,7 +1325,11 @@ impl eframe::App for App {
         // 2 FPS to keep timers/labels flowing without burning CPU. Tray menu
         // events wake the loop on their own (see the handler in `new`), and the
         // Win32 timer covers the stretches where winit's own wake-up can't run.
-        let period = if animating { 50 } else { 500 };
+        let period = if animating && !self.idle_hidden {
+            50
+        } else {
+            500
+        };
         if let Some(h) = self.hwnd {
             if self.timer_period != period {
                 arm_repaint_timer(h, period);
@@ -1005,7 +1342,7 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_reset;
+    use super::{fmt_reset, short_title};
     use chrono::{Duration, Utc};
 
     /// The window is still counting until its reset actually passes: rounding
@@ -1021,5 +1358,30 @@ mod tests {
         assert_eq!(rel(25 * 3600), "1d 1h");
         assert_eq!(rel(0), "обновление…", "the clock ran out, wait for a poll");
         assert_eq!(rel(-30), "обновление…");
+    }
+
+    /// The small designs have room for the leading unit and nothing else, so
+    /// the countdown must survive being cut down to it.
+    #[test]
+    fn the_tiny_countdown_keeps_the_leading_unit() {
+        let now = Utc::now();
+        let tiny = |secs: i64| fmt_reset(now + Duration::seconds(secs), now).2;
+
+        assert_eq!(tiny(40), "<1m");
+        assert_eq!(tiny(95), "1m");
+        assert_eq!(tiny(2 * 3600 + 5 * 60), "2h");
+        assert_eq!(tiny(25 * 3600), "1d");
+        assert_eq!(tiny(-30), "…", "no room for a word on a nano row");
+    }
+
+    #[test]
+    fn titles_shrink_to_a_couple_of_characters() {
+        assert_eq!(short_title("5-hour limit"), "5h");
+        assert_eq!(short_title("Weekly · all models"), "7d");
+        assert_eq!(short_title("Monthly limit"), "30d");
+        assert_eq!(short_title("7-day limit"), "7d");
+        // Antigravity's two rows keep the word that tells them apart.
+        assert_eq!(short_title("Gemini"), "Gemini");
+        assert_eq!(short_title("Claude / GPT"), "Claude");
     }
 }

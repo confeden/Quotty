@@ -2,7 +2,7 @@
 //! strip, opened centred on whichever monitor the user called it from.
 
 use crate::app::App;
-use crate::config::{ActiveMode, HeaderMode};
+use crate::config::{ActiveMode, HeaderMode, StripSize};
 use crate::providers::Family;
 use crate::shortcuts;
 
@@ -24,16 +24,49 @@ const WIN_W: f32 = 430.0;
 const WIN_TITLE: &str = "Quotty — настройки";
 const AUTHOR_URL: &str = "https://t.me/nova_txt";
 
+/// Windows' own UI face, in the weight the strip is drawn in. It is read from
+/// the system font folder rather than bundled — the licence does not allow
+/// shipping it, and it is on every Windows 10/11 machine anyway. egui's bundled
+/// font stays behind it as the fallback for anything Segoe has no glyph for,
+/// and for the machine where the file is missing.
+fn install_font(ctx: &egui::Context) {
+    let dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let path = std::path::Path::new(&dir).join("Fonts").join("seguisb.ttf");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::providers::dbg_log(&format!("font: {} unreadable: {e}", path.display()));
+            return;
+        }
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert(FONT.to_owned(), egui::FontData::from_owned(bytes));
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, FONT.to_owned());
+    ctx.set_fonts(fonts);
+}
+
+const FONT: &str = "segoe-ui-semibold";
+
 /// Dark palette shared with the strip. Written into *both* theme slots and the
 /// theme pinned to dark: egui keeps a style per theme and switches to the
 /// system one as soon as winit reports it, which would otherwise drop this.
 pub fn apply_style(ctx: &egui::Context) {
+    install_font(ctx);
     let mut style = (*ctx.style()).clone();
     let mut v = egui::Visuals::dark();
 
     v.panel_fill = BG;
     v.window_fill = BG;
-    v.extreme_bg_color = Color32::from_rgb(46, 51, 62); // slider rail
+    // Slider rail *and* scroll-bar track. It has to stay well below
+    // `widgets.inactive.bg_fill`, which egui uses for the scroll handle: at
+    // (46,51,62) against a (48,53,65) handle the bar was invisible.
+    v.extreme_bg_color = Color32::from_rgb(14, 16, 21);
     v.faint_bg_color = CARD;
     // Every widget's text goes through this, so nothing inherits egui's dim greys.
     v.override_text_color = Some(TEXT);
@@ -155,6 +188,16 @@ impl App {
             }
         });
 
+        // The window exists only once the viewport has had a frame; strip the
+        // system chrome off it the moment it does.
+        if self.settings_hwnd.is_none() {
+            self.settings_hwnd = own_settings_window();
+            #[cfg(windows)]
+            if let Some(h) = self.settings_hwnd {
+                drop_system_chrome(windows::Win32::Foundation::HWND(h as *mut _));
+            }
+        }
+
         // Never grow past the screen: a taller panel would push its own title
         // bar off the top and the buttons off the bottom, leaving no way to
         // close it. The content scrolls instead.
@@ -163,7 +206,11 @@ impl App {
             self.settings_h = want_h;
             // Re-centre once the final size is known.
             self.settings_center = true;
-        } else if self.settings_center && center_window(WIN_TITLE, self.settings_area) {
+        } else if self.settings_center
+            && self
+                .settings_hwnd
+                .is_some_and(|h| center_window(h, self.settings_area))
+        {
             self.settings_center = false;
         }
 
@@ -176,6 +223,8 @@ impl App {
         if close {
             self.show_settings = false;
             self.settings_center = false;
+            // The window goes with the viewport; the next open makes a new one.
+            self.settings_hwnd = None;
             self.settings.save();
         }
         self.shared
@@ -243,6 +292,37 @@ impl App {
             if ui.checkbox(&mut s.animate, "Анимация пузырьков").changed() {
                 s.save();
             }
+
+            ui.add_space(4.0);
+            caption(ui, "Дизайн полосы");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let mut pick = |ui: &mut egui::Ui, size: StripSize, label: &str| {
+                    if ui.selectable_label(s.strip_size == size, label).clicked() {
+                        s.strip_size = size;
+                        s.save();
+                    }
+                };
+                pick(ui, StripSize::Normal, "Обычный");
+                pick(ui, StripSize::Mini, "Мини");
+                pick(ui, StripSize::Nano, "Нано");
+            });
+
+            ui.add_space(4.0);
+            if ui
+                .checkbox(
+                    &mut s.hide_when_idle,
+                    "Прятать, пока инструменты не запущены",
+                )
+                .changed()
+            {
+                s.save();
+            }
+            ui.label(
+                RichText::new("Значок в трее остаётся на месте.")
+                    .size(10.5)
+                    .color(HINT),
+            );
 
             ui.add_space(4.0);
             caption(ui, "Заголовок строки");
@@ -325,12 +405,9 @@ impl App {
                 }
             });
             ui.label(
-                RichText::new(
-                    "«Активный» — квота того инструмента, окно которого было\n\
-                     на переднем плане последним (приложение, IDE или CLI).",
-                )
-                .size(10.5)
-                .color(HINT),
+                RichText::new("«Активный» — чьё окно было впереди последним.")
+                    .size(10.5)
+                    .color(HINT),
             );
         });
     }
@@ -389,7 +466,7 @@ impl App {
                 }
             });
             ui.label(
-                RichText::new("Проверка раз в 8 часов, только чтение тега релиза на GitHub.")
+                RichText::new("Раз в 8 часов, только тег релиза на GitHub.")
                     .size(10.5)
                     .color(HINT),
             );
@@ -426,9 +503,8 @@ impl App {
             }
             ui.label(
                 RichText::new(
-                    "Пишет в quotty-debug.log коды ответов, адрес API и время запросов.\n\
-                     Обезличено: без токенов, почты и имени пользователя.\n\
-                     Хранится сутки, никуда не отправляется — можно приложить к сообщению.",
+                    "quotty-debug.log: коды ответов и время запросов, без токенов\n\
+                     и имён. Хранится сутки, никуда не отправляется.",
                 )
                 .size(10.5)
                 .color(HINT),
@@ -611,27 +687,20 @@ pub(crate) fn window_work_area(_hwnd: isize) -> Option<(i32, i32, i32, i32)> {
 /// egui's viewport position is logical and relative to one screen, which lands
 /// in the wrong place on a multi-monitor desktop.
 #[cfg(windows)]
-fn center_window(title: &str, area: Option<(i32, i32, i32, i32)>) -> bool {
-    use windows::core::HSTRING;
-    use windows::Win32::Foundation::RECT;
+fn center_window(hwnd: isize, area: Option<(i32, i32, i32, i32)>) -> bool {
+    use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowRect, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE,
+        GetWindowRect, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE,
     };
     let Some((left, top, right, bottom)) = area else {
         return true; // nothing to aim at — leave the window where it is
     };
     unsafe {
-        let Ok(hwnd) = FindWindowW(None, &HSTRING::from(title)) else {
-            return false;
-        };
-        if hwnd.0.is_null() {
-            return false;
-        }
+        let hwnd = HWND(hwnd as *mut _);
         let mut win = RECT::default();
         if GetWindowRect(hwnd, &mut win).is_err() {
             return false;
         }
-        drop_system_chrome(hwnd);
         let x = left + ((right - left) - (win.right - win.left)) / 2;
         let y = top + ((bottom - top) - (win.bottom - win.top)) / 2;
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE).is_ok()
@@ -640,13 +709,17 @@ fn center_window(title: &str, area: Option<(i32, i32, i32, i32)>) -> bool {
 
 /// Windows 11 rounds and outlines every top-level window itself. On a
 /// borderless window that already paints its own rounded panel it shows up as a
-/// second arc in each corner, so turn both off and let the panel define the shape.
+/// second arc in each corner, so turn both off and let the panel define the
+/// shape — and then make the window's own alpha count, or the pixels outside
+/// that shape are composited as opaque black (G28).
 #[cfg(windows)]
 fn drop_system_chrome(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
-        DWMWCP_DONOTROUND,
+        DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWM_BB_BLURREGION, DWM_BB_ENABLE,
+        DWM_BLURBEHIND,
     };
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject};
     const COLOR_NONE: u32 = 0xFFFF_FFFE;
     unsafe {
         let pref = DWMWCP_DONOTROUND;
@@ -662,7 +735,53 @@ fn drop_system_chrome(hwnd: windows::Win32::Foundation::HWND) {
             &COLOR_NONE as *const _ as *const _,
             std::mem::size_of_val(&COLOR_NONE) as u32,
         );
+        // An empty blur region means "blur nothing, just honour the alpha
+        // channel" — the same call winit makes for a transparent window, which
+        // this viewport does not get.
+        let region = CreateRectRgn(0, 0, -1, -1);
+        let blur = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+            fEnable: true.into(),
+            hRgnBlur: region,
+            fTransitionOnMaximized: false.into(),
+        };
+        let _ = DwmEnableBlurBehindWindow(hwnd, &blur);
+        let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(region.0));
     }
+}
+
+/// Our own settings window, by title. `FindWindowW` alone matches on title
+/// across every process, so a second Quotty (a dev build beside the installed
+/// one) hands us *its* window — and we then move and re-chrome the wrong one.
+#[cfg(windows)]
+fn own_settings_window() -> Option<isize> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
+    unsafe {
+        let title = HSTRING::from(WIN_TITLE);
+        let mut prev = HWND::default();
+        loop {
+            let Ok(hwnd) = FindWindowExW(HWND::default(), prev, None, &title) else {
+                return None;
+            };
+            if hwnd.0.is_null() {
+                return None;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == GetCurrentProcessId() {
+                return Some(hwnd.0 as isize);
+            }
+            prev = hwnd;
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn own_settings_window() -> Option<isize> {
+    None
 }
 
 #[cfg(not(windows))]
@@ -671,6 +790,6 @@ pub(crate) fn cursor_work_area() -> Option<(i32, i32, i32, i32)> {
 }
 
 #[cfg(not(windows))]
-fn center_window(_title: &str, _area: Option<(i32, i32, i32, i32)>) -> bool {
+fn center_window(_hwnd: isize, _area: Option<(i32, i32, i32, i32)>) -> bool {
     true
 }

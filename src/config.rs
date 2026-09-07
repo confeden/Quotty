@@ -15,6 +15,19 @@ pub enum HeaderMode {
     Hidden,
 }
 
+/// How much room the strip takes. Smaller designs lose height and width: the
+/// text moves next to a shorter bar instead of sitting on a line of its own,
+/// and each step drops the least useful part of it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StripSize {
+    /// The original design: title + reset line over a full-width bar.
+    Normal,
+    /// One line per limit: short title · bar · percent + countdown.
+    Mini,
+    /// Bar + percent + countdown only, no titles.
+    Nano,
+}
+
 /// Which family the strip shows.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveMode {
@@ -37,6 +50,11 @@ pub struct Settings {
     pub animate: bool,
     /// Header line content.
     pub header_mode: HeaderMode,
+    /// How compact the strip is drawn.
+    pub strip_size: StripSize,
+    /// Keep the strip off screen while none of the enabled tools is running —
+    /// there is nothing to watch when nothing is spending quota.
+    pub hide_when_idle: bool,
     pub claude_enabled: bool,
     pub codex_enabled: bool,
     pub antigravity_enabled: bool,
@@ -55,6 +73,8 @@ impl Default for Settings {
             poll_secs: 60,
             animate: true,
             header_mode: HeaderMode::Full,
+            strip_size: StripSize::Normal,
+            hide_when_idle: true,
             claude_enabled: true,
             codex_enabled: true,
             antigravity_enabled: true,

@@ -19,7 +19,9 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([430.0, 100.0])
-        .with_min_inner_size([180.0, 40.0])
+        // Low enough for the Nano design with a single limit row; the window is
+        // not resizable by hand anyway.
+        .with_min_inner_size([160.0, 30.0])
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()

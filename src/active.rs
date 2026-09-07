@@ -62,7 +62,15 @@ pub struct Detector {
     /// terminal you are already looking at), so they are re-checked on a timer.
     from_tree: bool,
     checked_at: f64,
+    /// Cache behind `running()`.
+    running: u8,
+    running_at: f64,
 }
+
+/// How long the "which tools are running" answer is reused. Walking the process
+/// list is cheap but not free, and a strip that appears a couple of seconds
+/// after the tool did costs nothing.
+const RUNNING_TTL: f64 = 3.0;
 
 impl Default for Detector {
     fn default() -> Self {
@@ -71,6 +79,8 @@ impl Default for Detector {
             last: None,
             from_tree: false,
             checked_at: f64::MIN,
+            running: 0,
+            running_at: f64::MIN,
         }
     }
 }
@@ -98,6 +108,21 @@ impl Detector {
         self.from_tree = from_tree;
         self.checked_at = now;
         family
+    }
+
+    /// Bitmask over `Family::idx` of the families whose program is running at
+    /// all — app, IDE or CLI, foreground or not. Unlike `poll`, this asks "is
+    /// there anything to watch on this machine right now".
+    pub fn running(&mut self, now: f64) -> u8 {
+        if now - self.running_at <= RUNNING_TTL {
+            return self.running;
+        }
+        self.running_at = now;
+        self.running = winproc::snapshot()
+            .iter()
+            .filter_map(|p| direct(&p.name))
+            .fold(0u8, |mask, f| mask | 1 << f.idx());
+        self.running
     }
 }
 

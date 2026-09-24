@@ -15,8 +15,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 const RPC_PATH: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+/// The call the IDE's own usage panel makes. Unlike `GetUserStatus` — which
+/// carries one quota per model, always the 5-hour one — this returns every
+/// window the account is metered on, the weekly limit included.
+const QUOTA_PATH: &str = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 const REQUEST_BODY: &str = r#"{"metadata":{"ideName":"antigravity"}}"#;
-/// Antigravity quota windows roll over every 5 hours.
+/// Fallback window length, used only where nothing states one: `GetUserStatus`
+/// never does, and its quotas are the 5-hour ones.
 const WINDOW_SECS: i64 = 5 * 3600;
 
 // ---------------------------------------------------------------------------
@@ -368,6 +373,43 @@ struct QuotaInfo {
     reset_time: Option<serde_json::Value>,
 }
 
+/// `RetrieveUserQuotaSummary`: one group per model pool, one bucket per window.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaSummaryResponse {
+    #[serde(default)]
+    response: Option<QuotaSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaSummary {
+    #[serde(default)]
+    groups: Vec<QuotaGroup>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaGroup {
+    /// "Gemini Models" / "Claude and GPT models" — what `group_of` reads.
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    buckets: Vec<QuotaBucket>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaBucket {
+    /// "5h" / "weekly" — the only place Antigravity ever states a window length.
+    #[serde(default)]
+    window: Option<String>,
+    #[serde(default)]
+    remaining_fraction: Option<serde_json::Value>,
+    #[serde(default)]
+    reset_time: Option<serde_json::Value>,
+}
+
 pub fn fetch() -> Result<Snapshot, FetchError> {
     let eps = candidates();
     if eps.is_empty() {
@@ -378,7 +420,7 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
     let mut last_err = String::new();
     for ep in &eps {
         let started = std::time::Instant::now();
-        match call(ep) {
+        match user_status(ep) {
             Ok(status) => {
                 remember(ep);
                 diag(&format!(
@@ -386,7 +428,17 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
                     ep.port,
                     started.elapsed().as_millis()
                 ));
-                return Ok(build_snapshot(status));
+                // The quota summary is where the weekly window lives, but it is
+                // a newer method than `GetUserStatus`: a language server that
+                // does not know it must still get its 5-hour rows drawn.
+                let summary = match quota_summary(ep) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        diag(&format!("antigravity: quota summary -> {e}"));
+                        None
+                    }
+                };
+                return Ok(build_snapshot(status, summary));
             }
             Err(e) => {
                 diag(&format!("antigravity: port {} -> {e}", ep.port));
@@ -401,8 +453,8 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
     Err(format!("Antigravity не отвечает ({last_err})").into())
 }
 
-fn call(ep: &Endpoint) -> Result<UserStatus, String> {
-    let url = format!("https://127.0.0.1:{}{RPC_PATH}", ep.port);
+fn call<T: serde::de::DeserializeOwned>(ep: &Endpoint, path: &str) -> Result<T, String> {
+    let url = format!("https://127.0.0.1:{}{path}", ep.port);
     let resp = agent()
         .post(&url)
         .set("Content-Type", "application/json")
@@ -413,12 +465,24 @@ fn call(ep: &Endpoint) -> Result<UserStatus, String> {
             ureq::Error::Status(code, _) => format!("status {code}"),
             e => format!("{e}"),
         })?;
-    let parsed: StatusResponse = resp.into_json().map_err(|e| format!("parse status: {e}"))?;
-    parsed.user_status.ok_or("нет userStatus в ответе".into())
+    resp.into_json().map_err(|e| format!("parse: {e}"))
 }
 
-/// Model label → the quota group it draws from. All Gemini models (Pro *and*
-/// Flash) spend from one shared pool; the third-party models have their own.
+fn user_status(ep: &Endpoint) -> Result<UserStatus, String> {
+    call::<StatusResponse>(ep, RPC_PATH)?
+        .user_status
+        .ok_or("нет userStatus в ответе".into())
+}
+
+fn quota_summary(ep: &Endpoint) -> Result<QuotaSummary, String> {
+    call::<QuotaSummaryResponse>(ep, QUOTA_PATH)?
+        .response
+        .ok_or("нет response в сводке квот".into())
+}
+
+/// Model label — or the summary's group name — → the quota group it draws from.
+/// All Gemini models (Pro *and* Flash) spend from one shared pool; the
+/// third-party models have their own.
 fn group_of(label: &str) -> usize {
     if label.to_lowercase().contains("gemini") {
         0
@@ -429,26 +493,90 @@ fn group_of(label: &str) -> usize {
 
 const GROUP_TITLES: [&str; 2] = ["Gemini", "Claude / GPT"];
 
-fn build_snapshot(status: UserStatus) -> Snapshot {
-    let now = Utc::now();
+/// Seconds in a bucket's `window`, which the summary states as a word ("5h",
+/// "weekly"). An unknown word falls back to the 5-hour roll-over.
+fn window_secs(window: &str) -> i64 {
+    let w = window.trim().to_ascii_lowercase();
+    match w.as_str() {
+        "daily" => 24 * 3600,
+        "weekly" => 7 * 24 * 3600,
+        "monthly" => 30 * 24 * 3600,
+        _ => span_suffix(&w).unwrap_or(WINDOW_SECS),
+    }
+}
+
+/// "5h" / "7d" → seconds.
+fn span_suffix(s: &str) -> Option<i64> {
+    if let Some(n) = s.strip_suffix('h') {
+        return n.parse::<i64>().ok().map(|n| n * 3600);
+    }
+    if let Some(n) = s.strip_suffix('d') {
+        return n.parse::<i64>().ok().map(|n| n * 24 * 3600);
+    }
+    None
+}
+
+/// How a window is named in a row title: whole days as "7d", otherwise hours.
+fn window_label(secs: i64) -> String {
+    let day = 24 * 3600;
+    if secs >= day && secs % day == 0 {
+        format!("{}d", secs / day)
+    } else {
+        format!("{}h", (secs / 3600).max(1))
+    }
+}
+
+/// A fraction the service left out is a **zero** fraction: protobuf JSON omits
+/// default values, so an exhausted pool arrives as a bucket with a reset time
+/// and no `remainingFraction` at all. Reading that as "unknown" and dropping the
+/// row hid exactly the limit the user most needed to see.
+fn remaining_of(v: Option<&serde_json::Value>) -> f32 {
+    as_f64(v).unwrap_or(0.0).clamp(0.0, 1.0) as f32
+}
+
+/// One row per (model pool × window): Gemini 5h, Gemini 7d, Claude / GPT 5h,
+/// Claude / GPT 7d. Ordered by pool, then shortest window first — the same
+/// reading order as Claude's "5-hour limit" above "Weekly".
+fn limits_from_summary(summary: QuotaSummary, now: DateTime<Utc>) -> Vec<Limit> {
+    let mut rows: Vec<(usize, i64, Limit)> = Vec::new();
+    for group in summary.groups {
+        let g = group_of(group.display_name.as_deref().unwrap_or_default());
+        for b in group.buckets {
+            let secs = window_secs(b.window.as_deref().unwrap_or_default());
+            // Here the window length is stated, so the start is a fact rather
+            // than the assumption `ending_at` has to make elsewhere (I5).
+            let window = as_time(b.reset_time.as_ref())
+                .map(|r| LimitWindow::ending_at(r, chrono::Duration::seconds(secs), now));
+            rows.push((
+                g,
+                secs,
+                Limit {
+                    title: format!("{} · {}", GROUP_TITLES[g], window_label(secs)),
+                    used_percent: (1.0 - remaining_of(b.remaining_fraction.as_ref())) * 100.0,
+                    window,
+                },
+            ));
+        }
+    }
+    rows.sort_by_key(|(g, secs, _)| (*g, *secs));
+    rows.into_iter().map(|(_, _, lim)| lim).collect()
+}
+
+/// Quotas as `GetUserStatus` carries them: one per model, always the 5-hour
+/// window, no weekly row at all. Only reached against a language server that
+/// does not answer `RetrieveUserQuotaSummary`.
+fn limits_from_model_configs(data: Option<CascadeData>, now: DateTime<Utc>) -> Vec<Limit> {
     // Per group: worst (smallest) remaining fraction and earliest reset, so the
     // bar shows the limit the user will actually hit first.
     let mut worst: [Option<(f32, Option<DateTime<Utc>>)>; GROUP_TITLES.len()] = [None, None];
 
-    for cfg in status
-        .cascade_model_config_data
-        .into_iter()
-        .flat_map(|d| d.client_model_configs)
-    {
+    for cfg in data.into_iter().flat_map(|d| d.client_model_configs) {
         let (Some(label), Some(q)) = (cfg.label, cfg.quota_info) else {
-            continue;
-        };
-        let Some(remaining) = as_f64(q.remaining_fraction.as_ref()) else {
             continue;
         };
         let reset = as_time(q.reset_time.as_ref());
         let g = group_of(&label);
-        let remaining = remaining.clamp(0.0, 1.0) as f32;
+        let remaining = remaining_of(q.remaining_fraction.as_ref());
         match &mut worst[g] {
             None => worst[g] = Some((remaining, reset)),
             Some((r, t)) => {
@@ -468,7 +596,7 @@ fn build_snapshot(status: UserStatus) -> Snapshot {
             continue;
         };
         let resets_at = reset.unwrap_or(now + chrono::Duration::seconds(WINDOW_SECS));
-        // The RPC gives no window start; quotas roll over every 5 hours, so the
+        // No window start here either; quotas roll over every 5 hours, so the
         // start is derived from that. A reset further out than 5 hours means the
         // assumption does not hold for this row — `ending_at` then leaves the
         // start unplaced rather than pretending the window began now, which put
@@ -483,6 +611,15 @@ fn build_snapshot(status: UserStatus) -> Snapshot {
             )),
         });
     }
+    limits
+}
+
+fn build_snapshot(status: UserStatus, summary: Option<QuotaSummary>) -> Snapshot {
+    let now = Utc::now();
+    let limits = summary
+        .map(|s| limits_from_summary(s, now))
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| limits_from_model_configs(status.cascade_model_config_data, now));
 
     let tier = status.user_tier.and_then(|t| t.name).or_else(|| {
         status
@@ -522,5 +659,131 @@ fn as_time(v: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
             Utc.timestamp_opt(secs, 0).single()
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trimmed verbatim from a live `RetrieveUserQuotaSummary` on this machine:
+    /// two pools, each with a weekly and a 5-hour bucket, weekly listed first,
+    /// and the exhausted pool reporting `remainingFraction: 0`.
+    const SUMMARY: &str = r#"{"response":{"groups":[
+      {"displayName":"Gemini Models","buckets":[
+        {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.7057507,
+         "resetTime":"2026-09-10T20:23:48Z"},
+        {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.9228146,
+         "resetTime":"2026-09-08T03:43:32Z"}]},
+      {"displayName":"Claude and GPT models","buckets":[
+        {"bucketId":"3p-weekly","window":"weekly","remainingFraction":0,
+         "resetTime":"2026-09-08T08:03:48Z"},
+        {"bucketId":"3p-5h","window":"5h","remainingFraction":1,"disabled":true,
+         "resetTime":"2026-09-08T03:43:22Z"}]}]}}"#;
+
+    fn parse(raw: &str) -> QuotaSummary {
+        serde_json::from_str::<QuotaSummaryResponse>(raw)
+            .expect("summary parses")
+            .response
+            .expect("summary has a response")
+    }
+
+    #[test]
+    fn the_summary_becomes_one_row_per_pool_and_window() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 8, 0, 15, 0).unwrap();
+        let limits = limits_from_summary(parse(SUMMARY), now);
+
+        let titles: Vec<&str> = limits.iter().map(|l| l.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Gemini · 5h",
+                "Gemini · 7d",
+                "Claude / GPT · 5h",
+                "Claude / GPT · 7d"
+            ],
+            "pools in order, shortest window first"
+        );
+        // The weekly row is the point of the whole call: it must carry the
+        // service's own reset time, not a 5-hour one derived from now.
+        let weekly = &limits[1];
+        assert_eq!(
+            weekly.window.unwrap().resets_at,
+            Utc.with_ymd_and_hms(2026, 9, 10, 20, 23, 48).unwrap()
+        );
+        // Stated window length → a real, placeable start (I5 no longer guesses).
+        assert_eq!(
+            weekly.window.unwrap().start,
+            Some(Utc.with_ymd_and_hms(2026, 9, 3, 20, 23, 48).unwrap())
+        );
+        assert!((weekly.used_percent - 29.42).abs() < 0.01);
+        assert!(
+            (limits[3].used_percent - 100.0).abs() < 0.01,
+            "3p weekly is gone"
+        );
+    }
+
+    /// Protobuf JSON drops a zero, so the pool that matters most arrives with no
+    /// `remainingFraction` at all — that must read as 100 % spent, not as a
+    /// missing row (the bug that hid "Claude / GPT" once it ran out).
+    #[test]
+    fn a_missing_fraction_is_an_exhausted_pool() {
+        let raw = r#"{"response":{"groups":[{"displayName":"Claude and GPT models",
+          "buckets":[{"window":"weekly","resetTime":"2026-09-08T08:03:48Z"}]}]}}"#;
+        let now = Utc.with_ymd_and_hms(2026, 9, 8, 0, 15, 0).unwrap();
+        let limits = limits_from_summary(parse(raw), now);
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].used_percent, 100.0);
+
+        // Same rule on the legacy `GetUserStatus` path.
+        let data: CascadeData = serde_json::from_str(
+            r#"{"clientModelConfigs":[{"label":"Claude Opus 4.6 (Thinking)",
+                "quotaInfo":{"resetTime":"2026-09-08T08:03:48Z"}}]}"#,
+        )
+        .unwrap();
+        let legacy = limits_from_model_configs(Some(data), now);
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].title, "Claude / GPT");
+        assert_eq!(legacy[0].used_percent, 100.0);
+    }
+
+    /// Live probe against whatever language server is running right now — the
+    /// production path end to end. `cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn probe_live_quota() {
+        for ep in candidates() {
+            println!("endpoint :{}", ep.port);
+            match quota_summary(&ep) {
+                Ok(s) => {
+                    println!("  groups: {}", s.groups.len());
+                    for g in &s.groups {
+                        println!("  {:?} buckets={}", g.display_name, g.buckets.len());
+                    }
+                    for l in limits_from_summary(s, Utc::now()) {
+                        println!(
+                            "  row {:<20} {:.1}% {:?}",
+                            l.title, l.used_percent, l.window
+                        );
+                    }
+                }
+                Err(e) => println!("  summary error: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn window_words_become_lengths_and_labels() {
+        assert_eq!(window_secs("5h"), 5 * 3600);
+        assert_eq!(window_secs("weekly"), 7 * 24 * 3600);
+        assert_eq!(window_secs("Weekly"), 7 * 24 * 3600);
+        assert_eq!(window_secs("daily"), 24 * 3600);
+        assert_eq!(window_secs("12h"), 12 * 3600);
+        assert_eq!(window_secs(""), WINDOW_SECS, "unknown → the old assumption");
+        assert_eq!(window_secs("fortnightly"), WINDOW_SECS);
+
+        assert_eq!(window_label(5 * 3600), "5h");
+        assert_eq!(window_label(7 * 24 * 3600), "7d");
+        assert_eq!(window_label(30 * 24 * 3600), "30d");
     }
 }

@@ -13,7 +13,9 @@ fn direct(exe: &str) -> Option<Family> {
     match exe {
         "claude.exe" => Some(Family::Claude),
         "codex.exe" | "chatgpt.exe" => Some(Family::Codex),
-        "antigravity.exe" | "antigravity ide.exe" | "agy.exe" => Some(Family::Antigravity),
+        "antigravity.exe" | "antigravity.exe.real" | "antigravity ide.exe" | "agy.exe" => {
+            Some(Family::Antigravity)
+        }
         _ => None,
     }
 }
@@ -195,4 +197,21 @@ fn family_in_tree(root: u32, hop_parent: bool) -> Option<Family> {
 #[cfg(not(windows))]
 fn foreground_pid() -> Option<u32> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_known_processes() {
+        assert_eq!(direct("claude.exe"), Some(Family::Claude));
+        assert_eq!(direct("codex.exe"), Some(Family::Codex));
+        assert_eq!(direct("chatgpt.exe"), Some(Family::Codex));
+        assert_eq!(direct("antigravity.exe"), Some(Family::Antigravity));
+        assert_eq!(direct("antigravity.exe.real"), Some(Family::Antigravity));
+        assert_eq!(direct("antigravity ide.exe"), Some(Family::Antigravity));
+        assert_eq!(direct("agy.exe"), Some(Family::Antigravity));
+        assert_eq!(direct("notepad.exe"), None);
+    }
 }

@@ -1016,9 +1016,14 @@ fn draw_limit(
 
 /// A row title cut down to the couple of characters the small designs have room
 /// for: "5-hour limit" → "5h", "Weekly · all models" → "7d", "Claude / GPT" →
-/// "Claude". Anything unrecognised keeps its first word.
+/// "Claude". A title whose tail already *is* a window ("Gemini · 7d") keeps it,
+/// because that tail is the only thing telling its row from its neighbour's.
+/// Anything unrecognised keeps its first word.
 fn short_title(title: &str) -> String {
-    let head = title.split('·').next().unwrap_or(title).trim();
+    let (head, tail) = match title.split_once('·') {
+        Some((h, t)) => (h.trim(), t.trim()),
+        None => (title.trim(), ""),
+    };
     let low = head.to_ascii_lowercase();
     if let Some(n) = low.strip_suffix("-hour limit") {
         return format!("{n}h");
@@ -1026,11 +1031,24 @@ fn short_title(title: &str) -> String {
     if let Some(n) = low.strip_suffix("-day limit") {
         return format!("{n}d");
     }
+    let word = head.split_whitespace().next().unwrap_or(head);
+    if is_window_tag(tail) {
+        return format!("{word} {tail}");
+    }
     match low.as_str() {
         "weekly" => "7d".to_string(),
         "monthly limit" => "30d".to_string(),
-        _ => head.split_whitespace().next().unwrap_or(head).to_string(),
+        _ => word.to_string(),
     }
+}
+
+/// Is this a compact window tag like "5h" or "7d" — i.e. what the Antigravity
+/// rows put after the pool name?
+fn is_window_tag(s: &str) -> bool {
+    let Some(num) = s.strip_suffix(['h', 'd']) else {
+        return false;
+    };
+    !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// How long a limit keeps showing its last percentage after its window was due
@@ -1380,8 +1398,13 @@ mod tests {
         assert_eq!(short_title("Weekly · all models"), "7d");
         assert_eq!(short_title("Monthly limit"), "30d");
         assert_eq!(short_title("7-day limit"), "7d");
-        // Antigravity's two rows keep the word that tells them apart.
+        // Antigravity's rows keep the word that tells the pools apart...
         assert_eq!(short_title("Gemini"), "Gemini");
         assert_eq!(short_title("Claude / GPT"), "Claude");
+        // ...and the window tag that tells the two rows of one pool apart.
+        assert_eq!(short_title("Gemini · 5h"), "Gemini 5h");
+        assert_eq!(short_title("Gemini · 7d"), "Gemini 7d");
+        assert_eq!(short_title("Claude / GPT · 5h"), "Claude 5h");
+        assert_eq!(short_title("Claude / GPT · 7d"), "Claude 7d");
     }
 }

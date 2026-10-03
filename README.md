@@ -11,7 +11,7 @@
 
 - **Claude** — приложение Claude Desktop и Claude Code / CLI;
 - **Codex** — приложение Codex/ChatGPT и Codex CLI;
-- **Antigravity** — Antigravity 2.0, Antigravity IDE и CLI.
+- **Antigravity** — Antigravity 2.0 и Antigravity IDE.
 
 ## Возможности
 

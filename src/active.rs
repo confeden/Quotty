@@ -13,7 +13,7 @@ fn direct(exe: &str) -> Option<Family> {
     match exe {
         "claude.exe" => Some(Family::Claude),
         "codex.exe" | "chatgpt.exe" => Some(Family::Codex),
-        "antigravity.exe" | "antigravity.exe.real" | "antigravity ide.exe" | "agy.exe" => {
+        "antigravity.exe" | "antigravity.exe.real" | "antigravity ide.exe" => {
             Some(Family::Antigravity)
         }
         _ => None,
@@ -211,7 +211,8 @@ mod tests {
         assert_eq!(direct("antigravity.exe"), Some(Family::Antigravity));
         assert_eq!(direct("antigravity.exe.real"), Some(Family::Antigravity));
         assert_eq!(direct("antigravity ide.exe"), Some(Family::Antigravity));
-        assert_eq!(direct("agy.exe"), Some(Family::Antigravity));
+        // The agy CLI keeps its CSRF token in memory only, so its quota is unreadable.
+        assert_eq!(direct("agy.exe"), None);
         assert_eq!(direct("notepad.exe"), None);
     }
 }

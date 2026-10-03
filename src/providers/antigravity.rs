@@ -2,7 +2,7 @@
 //! the account's model quotas — the same RPC the IDE's own usage panel uses.
 //!
 //! There is no cloud endpoint we could call on our own: quota lives behind the
-//! language server, which every Antigravity surface (2.0 app, IDE, `agy` CLI)
+//! language server, which every Antigravity surface (2.0 app, IDE; the `agy` CLI too, but its token is in-memory only, so it is not tracked)
 //! starts. It listens on 127.0.0.1 over HTTPS with a **self-signed** cert and
 //! authenticates callers with a per-launch CSRF token, so we need both the port
 //! and that token, and we must skip certificate verification for it.

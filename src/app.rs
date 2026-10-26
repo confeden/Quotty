@@ -1,10 +1,10 @@
 //! The Quotty window (a compact, movable, translucent strip) plus tray wiring.
 
 use crate::active;
-use crate::config::{ActiveMode, HeaderMode, Settings, StripSize};
+use crate::config::{ActiveMode, Anchor, HeaderMode, Settings, StripSize};
 use crate::providers::{self, Family, Snapshot};
 use crate::shortcuts;
-use crate::tray::Tray;
+use crate::tray::{Action as TrayAction, Tray};
 use crate::update::{self, UpdateState};
 
 use chrono::{DateTime, Duration, Local, Utc};
@@ -268,9 +268,6 @@ pub struct App {
     reset_cache_sec: i64,
     /// Throttle for persisting the auto-switched family.
     last_family_save: f64,
-    /// Tray menu events, delivered via a handler that also wakes the UI so
-    /// changes are applied immediately, not on next hover.
-    menu_rx: std::sync::mpsc::Receiver<tray_icon::menu::MenuEvent>,
     /// Last time (s) we re-asserted always-on-top so the taskbar can't cover us.
     last_topmost: f64,
     /// Native window handle, resolved lazily from `eframe::Frame`.
@@ -329,9 +326,11 @@ fn force_topmost(_hwnd: isize) {}
 // operation this costs nothing.
 // ---------------------------------------------------------------------------
 
+#[cfg(windows)]
 const REPAINT_TIMER_ID: usize = 0x9101;
 static START: OnceLock<std::time::Instant> = OnceLock::new();
 static LAST_PAINT_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(windows)]
 static TIMER_GRACE_MS: AtomicU64 = AtomicU64::new(500);
 
 fn uptime_ms() -> u64 {
@@ -401,17 +400,9 @@ impl App {
         spawn_update_checker(shared.clone(), cc.egui_ctx.clone());
 
         let autostart = shortcuts::is_autostart_enabled();
-        let tray = Tray::new(autostart).ok();
-
-        // Route tray menu events through our own channel and wake the UI on each
-        // one, so a menu choice is applied immediately instead of on the next
-        // timer tick / mouse hover.
-        let (menu_tx, menu_rx) = std::sync::mpsc::channel();
-        let wake = cc.egui_ctx.clone();
-        tray_icon::menu::MenuEvent::set_event_handler(Some(move |ev| {
-            let _ = menu_tx.send(ev);
-            wake.request_repaint();
-        }));
+        // Without a tray (no StatusNotifierItem host on Linux) the strip still
+        // works: its right-click opens the settings window.
+        let tray = Tray::new(autostart, cc.egui_ctx.clone()).ok();
 
         Self {
             active: settings.family,
@@ -431,7 +422,6 @@ impl App {
             reset_cache: Vec::new(),
             reset_cache_sec: 0,
             last_family_save: f64::MIN,
-            menu_rx,
             last_topmost: 0.0,
             hwnd: None,
             timer_period: 0,
@@ -453,22 +443,23 @@ impl App {
     }
 
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
-        while let Ok(ev) = self.menu_rx.try_recv() {
-            let id = ev.id;
-            let Some(tray) = &self.tray else { continue };
-
-            if id == tray.id_quit {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            } else if id == tray.id_refresh {
-                self.shared.refresh.store(true, Ordering::Relaxed);
-                ctx.request_repaint();
-            } else if id == tray.id_settings {
-                self.open_settings(false);
-            } else if id == tray.id_autostart {
-                let now_checked = tray.autostart_item.is_checked();
-                match shortcuts::set_autostart(now_checked) {
-                    Ok(_) => self.autostart = now_checked,
-                    Err(_) => tray.autostart_item.set_checked(!now_checked),
+        let actions = self.tray.as_ref().map(Tray::drain).unwrap_or_default();
+        for action in actions {
+            match action {
+                TrayAction::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+                TrayAction::Refresh => {
+                    self.shared.refresh.store(true, Ordering::Relaxed);
+                    ctx.request_repaint();
+                }
+                TrayAction::Settings => self.open_settings(false),
+                TrayAction::Autostart => {
+                    let want = !self.autostart;
+                    if shortcuts::set_autostart(want).is_ok() {
+                        self.autostart = want;
+                    }
+                    if let Some(tray) = &self.tray {
+                        tray.set_autostart_checked(self.autostart);
+                    }
                 }
             }
         }
@@ -1078,6 +1069,25 @@ fn pseudo(a: f64, b: f64) -> f64 {
         .abs()
 }
 
+/// The bubbles of one stream that are alive at `tau` (time in slots), as
+/// `(age, jitter)`: age runs 0..1 from emission to death, jitter is a second
+/// random number in 0..1 for that bubble.
+///
+/// A stream does not beat on a fixed period. Each bubble is emitted at a random
+/// point of its own slot, so the gap to the next one lies somewhere between
+/// nothing and two slots. The emission times depend only on `key` and the slot
+/// index, so this stays stateless and resume-safe like the rest of the drawing.
+/// A bubble lives one slot, so only the two slots ending after `tau` can hold one.
+fn stream_bubbles(key: f64, tau: f64) -> impl Iterator<Item = (f32, f32)> {
+    let last = tau.floor();
+    [last - 1.0, last].into_iter().filter_map(move |slot| {
+        let age = tau - (slot + pseudo(key, slot));
+        (0.0..1.0)
+            .contains(&age)
+            .then(|| (age as f32, pseudo(key + 0.5, slot) as f32))
+    })
+}
+
 /// Headroom bubbles: emitted from the spend edge at varying heights, drifting a
 /// short way right and dissolving near the left (never reaching the marker).
 #[allow(clippy::too_many_arguments)]
@@ -1097,39 +1107,37 @@ fn draw_bubbles_headroom(
     // to the spend edge, bubbles dissolve near it; otherwise cap at max_reach.
     let reach = (marker_x - x_start).min(max_reach).max(6.0);
 
-    // Two lanes (upper/lower) so bubbles travel in pairs at different heights,
-    // phase-offset so they sit at different x too and never overlap.
+    // Two lanes (upper/lower) so bubbles sit at different heights, each lane
+    // carrying two independent streams.
     let lanes = [0.30f32, 0.70f32];
-    let per_lane = 2; // two staggered bubbles per lane → continuous stream
     let speed = 0.7;
+    let tau = t * speed;
     for (li, lane_y) in lanes.iter().enumerate() {
-        for j in 0..per_lane {
-            let ph = t * speed
-                + seed
-                + li as f64 * 0.37 // desync the two lanes in x
-                + j as f64 / per_lane as f64; // stagger within a lane
-            let p = ph.rem_euclid(1.0) as f32;
-            let cycle = ph.floor();
-            // Fade in fast, dissolve out by ~0.75 of the (short) travel.
-            let fade = ((p * 5.0).min(1.0) * (1.0 - (p / 0.75).min(1.0))).clamp(0.0, 1.0);
-            // Small per-cycle jitter around the lane height (kept within the lane
-            // band so the two lanes can't collide).
-            let jit = (pseudo(li as f64 * 3.0 + j as f64, cycle) as f32 - 0.5) * 0.12;
-            let x = x_start + reach * p;
-            let y = ub_top + ub_h * (lane_y + jit) - p * 1.5;
-            let a = (fade * 205.0 * (0.4 + 0.6 * op)) as u8;
-            let r = 0.9 + 0.9 * (1.0 - p);
-            painter.circle_filled(
-                Pos2::new(x, y),
-                r,
-                Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, a),
-            );
+        for j in 0..2 {
+            let key = seed + (li * 2 + j) as f64 + 0.25;
+            for (p, jitter) in stream_bubbles(key, tau) {
+                // Fade in fast, dissolve out by ~0.75 of the (short) travel.
+                let fade = ((p * 5.0).min(1.0) * (1.0 - (p / 0.75).min(1.0))).clamp(0.0, 1.0);
+                // Small per-bubble jitter around the lane height (kept within the
+                // lane band so the two lanes can't collide).
+                let jit = (jitter - 0.5) * 0.12;
+                let x = x_start + reach * p;
+                let y = ub_top + ub_h * (lane_y + jit) - p * 1.5;
+                let a = (fade * 205.0 * (0.4 + 0.6 * op)) as u8;
+                let r = 0.9 + 0.9 * (1.0 - p);
+                painter.circle_filled(
+                    Pos2::new(x, y),
+                    r,
+                    Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, a),
+                );
+            }
         }
     }
 }
 
 /// Lightweight procedural bubbles moving left→right, purely a function of time
-/// (no per-bubble state → cheap and resume-safe). `seed` desyncs rows.
+/// (no per-bubble state → cheap and resume-safe). `seed` desyncs rows; each of
+/// the `n` streams emits at its own irregular times (see `stream_bubbles`).
 #[allow(clippy::too_many_arguments)]
 fn draw_bubbles(
     painter: &egui::Painter,
@@ -1147,20 +1155,22 @@ fn draw_bubbles(
     if w < 4.0 {
         return;
     }
+    let tau = t * speed;
     for i in 0..n {
-        let ph = t * speed + seed + i as f64 / n as f64;
-        let p = ph.rem_euclid(1.0) as f32;
-        let x = x0 + w * p;
-        // Fade in on the left, out on the right.
-        let fade = (p * 3.0).min((1.0 - p) * 2.0).clamp(0.0, 1.0);
-        let bob = ((ph * 2.0).sin() as f32) * 1.1;
-        let a = (fade * 190.0 * (0.4 + 0.6 * op)) as u8;
-        let r = 1.3 + 1.0 * (1.0 - p);
-        painter.circle_filled(
-            Pos2::new(x, yc + bob),
-            r,
-            Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, a),
-        );
+        let key = seed + i as f64;
+        for (p, _) in stream_bubbles(key, tau) {
+            let x = x0 + w * p;
+            // Fade in on the left, out on the right.
+            let fade = (p * 3.0).min((1.0 - p) * 2.0).clamp(0.0, 1.0);
+            let bob = ((tau * 2.0 + key).sin() as f32) * 1.1;
+            let a = (fade * 190.0 * (0.4 + 0.6 * op)) as u8;
+            let r = 1.3 + 1.0 * (1.0 - p);
+            painter.circle_filled(
+                Pos2::new(x, yc + bob),
+                r,
+                Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, a),
+            );
+        }
     }
 }
 
@@ -1286,7 +1296,24 @@ impl eframe::App for App {
             m.pad_top + m.header_h + n_limits as f32 * m.row_h + m.pad_bottom,
         );
         if (want - self.applied_size).length() > 0.5 {
+            let first = self.applied_size == Vec2::ZERO;
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
+            if self.settings.anchor == Anchor::Bottom {
+                if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+                    // Keep the bottom edge where it is: the window grows and
+                    // shrinks upwards. On the first size, restore the bottom
+                    // saved at the last drag; without one, keep the top.
+                    let bottom = if first {
+                        self.settings.pos_bottom.unwrap_or(r.min.y + want.y)
+                    } else {
+                        r.max.y
+                    };
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(
+                        r.min.x,
+                        bottom - want.y,
+                    )));
+                }
+            }
             self.applied_size = want;
         }
 
@@ -1329,8 +1356,10 @@ impl eframe::App for App {
             self.dragging = false;
             if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
                 let p = (r.min.x, r.min.y);
-                if self.settings.pos != Some(p) {
+                let bottom = Some(r.max.y);
+                if self.settings.pos != Some(p) || self.settings.pos_bottom != bottom {
                     self.settings.pos = Some(p);
+                    self.settings.pos_bottom = bottom;
                     self.settings.save();
                 }
             }
@@ -1390,6 +1419,37 @@ mod tests {
         assert_eq!(tiny(2 * 3600 + 5 * 60), "2h");
         assert_eq!(tiny(25 * 3600), "1d");
         assert_eq!(tiny(-30), "…", "no room for a word on a nano row");
+    }
+
+    /// A stream is not a metronome: its bubbles are not evenly spaced, and it
+    /// still keeps about one bubble alive on average (one slot of life each).
+    #[test]
+    fn bubbles_come_at_irregular_times() {
+        use super::stream_bubbles;
+        let mut emissions = Vec::new();
+        let mut alive_total = 0usize;
+        let steps = 20_000;
+        for s in 0..steps {
+            let tau = s as f64 * 0.01;
+            let alive: Vec<_> = stream_bubbles(0.3, tau).collect();
+            for (age, _) in &alive {
+                assert!((0.0..1.0).contains(age));
+            }
+            alive_total += alive.len();
+            if alive.is_empty() {
+                continue;
+            }
+            // Emission moment of the youngest bubble seen at this step.
+            let youngest = alive.iter().map(|(a, _)| *a).fold(f32::MAX, f32::min);
+            emissions.push(tau - youngest as f64);
+        }
+        let mut gaps: Vec<f64> = emissions.windows(2).map(|w| w[1] - w[0]).collect();
+        gaps.retain(|g| *g > 0.015);
+        let min = gaps.iter().cloned().fold(f64::MAX, f64::min);
+        let max = gaps.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(max - min > 0.2, "gaps look fixed: {min:.3}..{max:.3}");
+        let density = alive_total as f64 / steps as f64;
+        assert!((0.7..1.3).contains(&density), "density {density:.2}");
     }
 
     #[test]

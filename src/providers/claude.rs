@@ -159,10 +159,12 @@ fn find_claude_files() -> Result<ClaudeFiles, String> {
     ))
 }
 
+#[cfg(windows)]
 #[derive(Deserialize)]
 struct LocalState {
     os_crypt: OsCrypt,
 }
+#[cfg(windows)]
 #[derive(Deserialize)]
 struct OsCrypt {
     encrypted_key: String,
@@ -314,6 +316,76 @@ pub fn load_tokens() -> Result<Vec<OauthToken>, String> {
     Ok(tokens)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeCredentials {
+    access_token: String,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    subscription_type: Option<String>,
+    #[serde(default)]
+    rate_limit_tier: Option<String>,
+}
+
+/// Claude Code's own login: the `claudeAiOauth` object in `.credentials.json`,
+/// plain JSON on every platform. Read only — Claude Code refreshes that token
+/// itself, and a write from here would race its refresh (the rule I2 keeps for
+/// Codex).
+fn code_token() -> Option<OauthToken> {
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))?;
+    let text = std::fs::read_to_string(dir.join(".credentials.json")).ok()?;
+    let file: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let creds: CodeCredentials = serde_json::from_value(file.get("claudeAiOauth")?.clone()).ok()?;
+    // Zero or absent means the file does not say; the server decides then. A
+    // date already past is skipped here instead of costing a 401.
+    let now_ms = Utc::now().timestamp_millis();
+    if creds.expires_at.is_some_and(|ms| ms > 0 && ms <= now_ms) {
+        return None;
+    }
+    Some(OauthToken {
+        access: creds.access_token,
+        subscription: creds.subscription_type,
+        tier: creds.rate_limit_tier,
+        source: "Code",
+    })
+}
+
+/// Claude Code runs as a plain `claude` executable. Claude Desktop also ships a
+/// `Claude.exe` (same lower-cased name), but it lives in its Store package
+/// directory, and that one is not the CLI.
+fn claude_code_running() -> bool {
+    use crate::winproc;
+    winproc::snapshot().iter().any(|p| {
+        (p.name == "claude.exe" || p.name == "claude")
+            && !winproc::image_path(p.pid)
+                .is_some_and(|path| path.to_lowercase().contains("windowsapps"))
+    })
+}
+
+/// The tokens to try this poll, best first. While Claude Code runs, its own
+/// login goes first. Claude Desktop's cache follows as the fallback; without a
+/// running Claude Code it is the only source.
+fn account_tokens() -> Result<Vec<OauthToken>, String> {
+    let mut tokens: Vec<OauthToken> = Vec::new();
+    if claude_code_running() {
+        tokens.extend(code_token());
+    }
+    match load_tokens() {
+        Ok(mut desktop) => tokens.append(&mut desktop),
+        // Nothing from Claude Code either: say so, with the Desktop reason behind it.
+        Err(e) if tokens.is_empty() => {
+            return Err(format!(
+                "запустите Claude Code и войдите; Claude Desktop: {e}"
+            ))
+        }
+        Err(e) => dbg_log(&format!("claude: Claude Desktop tokens unavailable: {e}")),
+    }
+    Ok(tokens)
+}
+
 // ---------------------------------------------------------------------------
 // Usage endpoint
 // ---------------------------------------------------------------------------
@@ -454,7 +526,7 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
             (left.as_secs() / 60) + 1
         )));
     }
-    let mut tokens = load_tokens()?;
+    let mut tokens = account_tokens()?;
 
     // Try the previously-working token first.
     if let Some(good) = LAST_GOOD.lock().unwrap().clone() {

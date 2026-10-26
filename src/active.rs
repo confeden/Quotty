@@ -11,11 +11,14 @@ use crate::winproc;
 /// Exe name → family, for windows that *are* the tool.
 fn direct(exe: &str) -> Option<Family> {
     match exe {
-        "claude.exe" => Some(Family::Claude),
-        "codex.exe" | "chatgpt.exe" => Some(Family::Codex),
-        "antigravity.exe" | "antigravity.exe.real" | "antigravity ide.exe" => {
-            Some(Family::Antigravity)
-        }
+        // Linux names come from the kernel's `comm`: no extension, and no space.
+        "claude.exe" | "claude" => Some(Family::Claude),
+        "codex.exe" | "chatgpt.exe" | "codex" => Some(Family::Codex),
+        "antigravity.exe"
+        | "antigravity.exe.real"
+        | "antigravity ide.exe"
+        | "antigravity"
+        | "antigravity-ide" => Some(Family::Antigravity),
         _ => None,
     }
 }
@@ -147,8 +150,7 @@ fn foreground_pid() -> Option<u32> {
 }
 
 fn process_name(pid: u32) -> Option<String> {
-    let full = winproc::image_path(pid)?;
-    Some(full.rsplit(['\\', '/']).next()?.to_string())
+    winproc::name_of(pid)
 }
 
 /// Walk everything started under `root` and return the family of the most
@@ -194,7 +196,46 @@ fn family_in_tree(root: u32, hop_parent: bool) -> Option<Family> {
     best.map(|(_, f)| f)
 }
 
-#[cfg(not(windows))]
+/// X11: the window manager names the active window in `_NET_ACTIVE_WINDOW`, and
+/// `_NET_WM_PID` gives its process. Wayland exposes no such thing to a client, so
+/// there the answer stays `None` and the caller keeps the previous family.
+#[cfg(target_os = "linux")]
+fn foreground_pid() -> Option<u32> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+
+    let (conn, screen) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.get(screen)?.root;
+    let atom = |name: &str| -> Option<u32> {
+        Some(
+            conn.intern_atom(false, name.as_bytes())
+                .ok()?
+                .reply()
+                .ok()?
+                .atom,
+        )
+    };
+    let active = atom("_NET_ACTIVE_WINDOW")?;
+    let wm_pid = atom("_NET_WM_PID")?;
+
+    let win = conn
+        .get_property(false, root, active, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()?
+        .next()?;
+    let pid = conn
+        .get_property(false, win, wm_pid, AtomEnum::CARDINAL, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()?
+        .next()?;
+    (pid != 0).then_some(pid)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn foreground_pid() -> Option<u32> {
     None
 }

@@ -28,6 +28,16 @@ pub enum StripSize {
     Nano,
 }
 
+/// Which edge of the strip stays put when its height changes (a row appears or
+/// goes, or the design changes).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// The strip grows and shrinks downwards from its top edge.
+    Top,
+    /// The strip grows and shrinks upwards from its bottom edge.
+    Bottom,
+}
+
 /// Which family the strip shows.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveMode {
@@ -42,8 +52,12 @@ pub enum ActiveMode {
 pub struct Settings {
     /// Window opacity, 0.15..=1.0
     pub opacity: f32,
-    /// Last window position (screen points). None = let the OS place it.
+    /// Last window position (screen points, top-left). None = let the OS place it.
     pub pos: Option<(f32, f32)>,
+    /// Bottom edge of the window at the last drag, for `Anchor::Bottom`.
+    pub pos_bottom: Option<f32>,
+    /// Edge that stays put when the height changes.
+    pub anchor: Anchor,
     /// Poll interval in seconds.
     pub poll_secs: u64,
     /// Bubble animation on/off (off = lowest CPU).
@@ -70,6 +84,8 @@ impl Default for Settings {
         Self {
             opacity: 0.8,
             pos: None,
+            pos_bottom: None,
+            anchor: Anchor::Bottom,
             poll_secs: 60,
             animate: true,
             header_mode: HeaderMode::Full,

@@ -1,6 +1,6 @@
 [package]
 name = "quotty"
-version = "1.4.3"
+version = "1.5.0"
 edition = "2021"
 description = "Quotty - a movable strip showing the quota and reset timers of the AI tool you are using"
 
@@ -12,9 +12,6 @@ path = "src/main.rs"
 # GUI — glow only (no wgpu backend, keeps the binary + memory small)
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.29"
-
-# Tray
-tray-icon = "0.19"
 
 # HTTP + JSON
 ureq = { version = "2.10", features = ["json", "tls"] }
@@ -32,17 +29,25 @@ aes-gcm = "0.10"
 # Time
 chrono = { version = "0.4", features = ["clock"] }
 
-# Shortcuts (.lnk) for desktop + autostart
-mslnk = "0.1"
 dirs = "5"
 
 # Native window handle, to keep the strip above the taskbar
 raw-window-handle = "0.6"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Active window on X11 (`_NET_ACTIVE_WINDOW`). Pure Rust, no system libraries.
+x11rb = "0.13"
+# StatusNotifierItem tray icon (D-Bus, pure Rust). No GTK, so no extra packages.
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+
 [build-dependencies]
 embed-resource = "2"
 
 [target.'cfg(windows)'.dependencies]
+# Tray (Win32). On Linux the tray is ksni, see below.
+tray-icon = "0.19"
+# Shortcuts (.lnk) for desktop + autostart. Linux writes .desktop files instead.
+mslnk = "0.1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",

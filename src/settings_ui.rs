@@ -2,7 +2,7 @@
 //! strip, opened centred on whichever monitor the user called it from.
 
 use crate::app::App;
-use crate::config::{ActiveMode, HeaderMode, StripSize};
+use crate::config::{ActiveMode, Anchor, HeaderMode, StripSize};
 use crate::providers::Family;
 use crate::shortcuts;
 
@@ -151,6 +151,25 @@ impl App {
                     // The title bar stays outside the scroll area: on a screen
                     // too short for the whole panel, ✕ must still be reachable.
                     close |= self.title_bar(ui, ctx);
+
+                    // The footer is a bottom panel declared before the scroll
+                    // area, so it takes its own strip at the bottom of the window
+                    // and ЗАКРЫТЬ stays there whatever part of the settings is
+                    // scrolled to.
+                    let footer = egui::TopBottomPanel::bottom("settings-footer")
+                        .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 8.0)))
+                        .show_separator_line(false)
+                        .show_inside(ui, |ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Закрыть").clicked() {
+                                        close = true;
+                                    }
+                                },
+                            );
+                        });
+
                     let scrolled = egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .scroll_bar_visibility(
@@ -162,22 +181,14 @@ impl App {
                             refresh_now |= self.polling_card(ui);
                             self.system_card(ui);
                             check_update |= self.version_card(ui);
-
-                            ui.add_space(8.0);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Закрыть").clicked() {
-                                        close = true;
-                                    }
-                                },
-                            );
                         });
+
                     // Fit the window to its content instead of guessing a
                     // height — `content_size` is the *unclamped* height, so this
                     // does not feed back into itself once the window is capped.
                     let head = scrolled.inner_rect.min.y - ui.max_rect().min.y;
-                    content_h = head + scrolled.content_size.y + 24.0;
+                    content_h =
+                        head + scrolled.content_size.y + footer.response.rect.height() + 24.0;
                     max_h = work_area_height(ctx, self.settings_area);
                 });
 
@@ -306,6 +317,20 @@ impl App {
                 pick(ui, StripSize::Normal, "Обычный");
                 pick(ui, StripSize::Mini, "Мини");
                 pick(ui, StripSize::Nano, "Нано");
+            });
+
+            ui.add_space(4.0);
+            caption(ui, "Закреплено при смене высоты");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let mut pick = |ui: &mut egui::Ui, anchor: Anchor, label: &str| {
+                    if ui.selectable_label(s.anchor == anchor, label).clicked() {
+                        s.anchor = anchor;
+                        s.save();
+                    }
+                };
+                pick(ui, Anchor::Bottom, "Снизу");
+                pick(ui, Anchor::Top, "Сверху");
             });
 
             ui.add_space(4.0);
@@ -484,7 +509,7 @@ impl App {
             {
                 self.autostart = a;
                 if let Some(t) = &self.tray {
-                    t.autostart_item.set_checked(a);
+                    t.set_autostart_checked(a);
                 }
             }
             if ui.button("Создать ярлык на рабочем столе").clicked() {
@@ -601,21 +626,27 @@ fn reveal_log() {
     let Some(path) = crate::providers::log_path() else {
         return;
     };
-    let arg = if path.exists() {
-        format!("/select,{}", path.display())
-    } else {
-        path.parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
-    };
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let arg = if path.exists() {
+            format!("/select,{}", path.display())
+        } else {
+            path.parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
         let _ = std::process::Command::new("explorer.exe")
             .raw_arg(&arg)
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // No portable "select this file" on Linux: open the folder holding it.
+        let dir = path.parent().unwrap_or(&path).to_path_buf();
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
 }
 

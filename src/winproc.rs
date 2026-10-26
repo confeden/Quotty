@@ -167,19 +167,153 @@ pub fn listening_ports() -> Vec<(u32, u16)> {
     }
 }
 
-#[cfg(not(windows))]
+// ---------------------------------------------------------------------------
+// Linux: /proc. Everything is readable for the processes of the same user, which
+// is the only set Quotty needs (the AI tools run under the logged-in user).
+// ---------------------------------------------------------------------------
+
+/// Process name as the kernel records it (`comm`, at most 15 bytes), lower-cased.
+#[cfg(target_os = "linux")]
+pub fn name_of(pid: u32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim_end().to_lowercase())
+}
+
+#[cfg(target_os = "linux")]
+pub fn snapshot() -> Vec<Proc> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let name = name_of(pid)?;
+            // `/proc/<pid>/stat` is `pid (comm) state ppid ...`; `comm` may hold
+            // spaces or parentheses, so split after the last `)`.
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let parent = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            Some(Proc { pid, parent, name })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub fn image_path(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "linux")]
+pub fn command_line(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let text = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+/// (pid, port) for every IPv4 TCP socket in LISTEN state, as `/proc/net/tcp`
+/// describes them, with the owning pid found through the `socket:[inode]` links.
+#[cfg(target_os = "linux")]
+pub fn listening_ports() -> Vec<(u32, u16)> {
+    let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else {
+        return Vec::new();
+    };
+    // inode -> port, for sockets in LISTEN (state 0A).
+    let listening: Vec<(u64, u16)> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.get(3)? != &"0A" {
+                return None;
+            }
+            let port = u16::from_str_radix(cols.get(1)?.rsplit_once(':')?.1, 16).ok()?;
+            Some((cols.get(9)?.parse().ok()?, port))
+        })
+        .collect();
+    if listening.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in dir.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue; // another user's process: not ours to read
+        };
+        for fd in fds.flatten() {
+            let Ok(link) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(inode) = link
+                .to_string_lossy()
+                .strip_prefix("socket:[")
+                .and_then(|s| s.strip_suffix(']'))
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            out.extend(
+                listening
+                    .iter()
+                    .filter(|(ino, _)| *ino == inode)
+                    .map(|(_, port)| (pid, *port)),
+            );
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Other platforms: nothing to look at.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn name_of(_pid: u32) -> Option<String> {
+    None
+}
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn snapshot() -> Vec<Proc> {
     Vec::new()
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn image_path(_pid: u32) -> Option<String> {
     None
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn command_line(_pid: u32) -> Option<String> {
     None
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn listening_ports() -> Vec<(u32, u16)> {
     Vec::new()
+}
+
+/// Name of the executable behind `pid`, lower-cased: the file name on Windows,
+/// the kernel's `comm` on Linux (a native CLI installed under a versioned path
+/// still reports its own name there).
+#[cfg(windows)]
+pub fn name_of(pid: u32) -> Option<String> {
+    let full = image_path(pid)?;
+    Some(full.rsplit(['\\', '/']).next()?.to_lowercase())
 }

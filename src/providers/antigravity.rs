@@ -534,13 +534,32 @@ fn remaining_of(v: Option<&serde_json::Value>) -> f32 {
     as_f64(v).unwrap_or(0.0).clamp(0.0, 1.0) as f32
 }
 
+/// A summary group's place and row title. The two shared pools come first as
+/// before; a quota of its own for one Gemini model ("Gemini 4 Argon", on top of
+/// the shared Gemini pool) gets a row named after that model — "G. Argon" —
+/// right below the Gemini pool, instead of a second row titled "Gemini".
+fn summary_group(name: &str) -> (usize, String) {
+    let lower = name.to_lowercase();
+    if lower.contains("claude") || lower.contains("gpt") {
+        return (2, GROUP_TITLES[1].to_string());
+    }
+    if lower.contains("gemini") {
+        if lower.contains("models") || lower.trim() == "gemini" {
+            return (0, GROUP_TITLES[0].to_string());
+        }
+        let model = name.split_whitespace().last().unwrap_or(name);
+        return (1, format!("G. {model}"));
+    }
+    (3, name.trim().to_string())
+}
+
 /// One row per (model pool × window): Gemini 5h, Gemini 7d, Claude / GPT 5h,
 /// Claude / GPT 7d. Ordered by pool, then shortest window first — the same
 /// reading order as Claude's "5-hour limit" above "Weekly".
 fn limits_from_summary(summary: QuotaSummary, now: DateTime<Utc>) -> Vec<Limit> {
-    let mut rows: Vec<(usize, i64, Limit)> = Vec::new();
+    let mut rows: Vec<((usize, String), i64, Limit)> = Vec::new();
     for group in summary.groups {
-        let g = group_of(group.display_name.as_deref().unwrap_or_default());
+        let g = summary_group(group.display_name.as_deref().unwrap_or_default());
         for b in group.buckets {
             let secs = window_secs(b.window.as_deref().unwrap_or_default());
             // Here the window length is stated, so the start is a fact rather
@@ -548,17 +567,17 @@ fn limits_from_summary(summary: QuotaSummary, now: DateTime<Utc>) -> Vec<Limit> 
             let window = as_time(b.reset_time.as_ref())
                 .map(|r| LimitWindow::ending_at(r, chrono::Duration::seconds(secs), now));
             rows.push((
-                g,
+                g.clone(),
                 secs,
                 Limit {
-                    title: format!("{} · {}", GROUP_TITLES[g], window_label(secs)),
+                    title: format!("{} · {}", g.1, window_label(secs)),
                     used_percent: (1.0 - remaining_of(b.remaining_fraction.as_ref())) * 100.0,
                     window,
                 },
             ));
         }
     }
-    rows.sort_by_key(|(g, secs, _)| (*g, *secs));
+    rows.sort_by(|(a, sa, _), (b, sb, _)| (a, sa).cmp(&(b, sb)));
     rows.into_iter().map(|(_, _, lim)| lim).collect()
 }
 
@@ -686,6 +705,26 @@ mod tests {
             .expect("summary parses")
             .response
             .expect("summary has a response")
+    }
+
+    #[test]
+    fn a_model_quota_of_its_own_gets_its_own_title_below_the_gemini_pool() {
+        let raw = r#"{"response":{"groups":[
+          {"displayName":"Claude and GPT models","buckets":[
+            {"window":"weekly","remainingFraction":1,"resetTime":"2026-11-14T00:00:00Z"}]},
+          {"displayName":"Gemini 4 Argon","buckets":[
+            {"window":"weekly","remainingFraction":0.7,"resetTime":"2026-11-14T00:00:00Z"}]},
+          {"displayName":"Gemini Models","buckets":[
+            {"window":"weekly","remainingFraction":1,"resetTime":"2026-11-14T00:00:00Z"},
+            {"window":"5h","remainingFraction":1,"resetTime":"2026-11-08T05:00:00Z"}]}]}}"#;
+        let now = Utc.with_ymd_and_hms(2026, 11, 8, 1, 0, 0).unwrap();
+        let limits = limits_from_summary(parse(raw), now);
+        let titles: Vec<&str> = limits.iter().map(|l| l.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["Gemini · 5h", "Gemini · 7d", "G. Argon · 7d", "Claude / GPT · 7d"]
+        );
+        assert!((limits[2].used_percent - 30.0).abs() < 0.01);
     }
 
     #[test]

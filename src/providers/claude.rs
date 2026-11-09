@@ -49,7 +49,8 @@ fn candidate_dirs() -> Vec<PathBuf> {
     dirs_list
 }
 
-/// Data directories of Store-installed Claude packages.
+/// Data directories under `%LOCALAPPDATA%`: the current `Claude-Data` store and
+/// the package containers of Store-installed Claude.
 fn msix_dirs(out: &mut Vec<PathBuf>) {
     let mut locals: Vec<PathBuf> = Vec::new();
     if let Ok(l) = std::env::var("LOCALAPPDATA") {
@@ -61,6 +62,17 @@ fn msix_dirs(out: &mut Vec<PathBuf>) {
     locals.dedup();
 
     for local in locals {
+        // Since early November 2026 Claude Desktop keeps its data outside both
+        // `%APPDATA%` and the package container, one folder per install under
+        // `%LOCALAPPDATA%\Claude-Data` (`claude_<publisher id>`); the old
+        // `%APPDATA%\Claude` is left with only a `.user-data-left.*` marker.
+        if let Ok(data) = std::fs::read_dir(local.join("Claude-Data")) {
+            for entry in data.flatten() {
+                if entry.path().is_dir() {
+                    out.push(entry.path());
+                }
+            }
+        }
         let Ok(packages) = std::fs::read_dir(local.join("Packages")) else {
             continue;
         };
@@ -503,6 +515,88 @@ fn request_usage(access: &str) -> Result<UsageResponse, (Failure, String)> {
     }
 }
 
+/// How often the header fallback may spend a real request.
+const HEADER_PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+/// The last snapshot the header fallback built, and when.
+static LAST_HEADERS: std::sync::Mutex<Option<(std::time::Instant, Snapshot)>> =
+    std::sync::Mutex::new(None);
+
+/// The same two windows, read off the rate-limit headers every inference reply
+/// carries (`anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`) — what
+/// Claude Code itself reads its limits from. Used only while the usage endpoint
+/// is refusing: it costs a one-token Haiku request, so it runs at most every
+/// `HEADER_PROBE_EVERY` and the snapshot is reused in between.
+fn request_headers(access: &str) -> Result<UsageResponse, String> {
+    let body = r#"{"model":"claude-haiku-4-5","max_tokens":1,"system":"You are Claude Code, Anthropic's official CLI for Claude.","messages":[{"role":"user","content":"."}]}"#;
+    let resp = match ureq::post("https://api.anthropic.com/v1/messages")
+        .set("Authorization", &format!("Bearer {access}"))
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .set("User-Agent", "Quotty/0.1")
+        .timeout(std::time::Duration::from_secs(20))
+        .send_string(body)
+    {
+        Ok(r) => r,
+        // A 429 here still carries the headers: that is the account at its limit.
+        Err(ureq::Error::Status(429, r)) => r,
+        Err(ureq::Error::Status(code, _)) => return Err(format!("status {code}")),
+        Err(e) => return Err(format!("network: {e}")),
+    };
+    let window = |w: &str| -> Option<UsageWindow> {
+        let util = resp
+            .header(&format!("anthropic-ratelimit-unified-{w}-utilization"))?
+            .trim()
+            .parse::<f64>()
+            .ok()?;
+        let resets_at = resp
+            .header(&format!("anthropic-ratelimit-unified-{w}-reset"))
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .and_then(|t| DateTime::<Utc>::from_timestamp(t, 0))
+            .map(|t| t.to_rfc3339());
+        Some(UsageWindow {
+            utilization: Some(util * 100.0),
+            resets_at,
+        })
+    };
+    let usage = UsageResponse {
+        five_hour: window("5h"),
+        seven_day: window("7d"),
+    };
+    if usage.five_hour.is_none() && usage.seven_day.is_none() {
+        return Err("no rate-limit headers".into());
+    }
+    Ok(usage)
+}
+
+/// The usage endpoint refused every token (or a cooldown is on): read the
+/// limits off an inference reply instead. Falls back to `refused` — the
+/// "лимит запросов" error — only when that fails too.
+fn headers_fallback(refused: String) -> Result<Snapshot, FetchError> {
+    if let Some((at, snap)) = LAST_HEADERS.lock().unwrap().as_ref() {
+        if at.elapsed() < HEADER_PROBE_EVERY {
+            return Ok(snap.clone());
+        }
+    }
+    let tokens = account_tokens().map_err(|_| FetchError::rate_limited(refused.clone()))?;
+    for tok in &tokens {
+        match request_headers(&tok.access) {
+            Ok(usage) => {
+                diag(&format!(
+                    "claude: limits from inference headers (token {}/{})",
+                    tok.source,
+                    tok.subscription.as_deref().unwrap_or("-")
+                ));
+                let snap = build_snapshot(usage, tok);
+                *LAST_HEADERS.lock().unwrap() = Some((std::time::Instant::now(), snap.clone()));
+                return Ok(snap);
+            }
+            Err(e) => dbg_log(&format!("claude: headers via token {} -> {e}", tok.source)),
+        }
+    }
+    Err(FetchError::rate_limited(refused))
+}
+
 /// Which address the usage endpoint currently resolves to. Worth a line in the
 /// log: a machine reaching Anthropic through an unblocking relay shares that
 /// relay's rate limit with everyone else behind it, which looks exactly like a
@@ -521,10 +615,10 @@ fn endpoint_ip() -> String {
 /// usage endpoint until one succeeds.
 pub fn fetch() -> Result<Snapshot, FetchError> {
     if let Some(left) = cooldown_left() {
-        return Err(FetchError::rate_limited(format!(
+        return headers_fallback(format!(
             "лимит запросов, пауза {} мин",
             (left.as_secs() / 60) + 1
-        )));
+        ));
     }
     let mut tokens = account_tokens()?;
 
@@ -599,9 +693,7 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
             "claude: every token rate limited, sleeping {}s",
             wait.as_secs()
         ));
-        return Err(FetchError::rate_limited(format!(
-            "лимит запросов, пауза {mins} мин"
-        )));
+        return headers_fallback(format!("лимит запросов, пауза {mins} мин"));
     }
     Err(format!("usage request: {last_err}").into())
 }
@@ -779,6 +871,55 @@ mod tests {
                     println!("{}: status {code}, retry-after {retry:?}", tok.source);
                 }
                 Err(e) => println!("{}: {e}", tok.source),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_ratelimit_headers() {
+        let mut toks = super::load_tokens().map_err(|e| println!("desktop: {e}")).unwrap_or_default();
+        toks.extend(super::code_token());
+        for tok in &toks {
+            for (path, body) in [
+                (
+                    "/v1/messages/count_tokens",
+                    r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"."}]}"#,
+                ),
+                (
+                    "/v1/messages",
+                    r#"{"model":"claude-haiku-4-5","max_tokens":1,"system":"You are Claude Code, Anthropic's official CLI for Claude.","messages":[{"role":"user","content":"."}]}"#,
+                ),
+            ] {
+                let r = ureq::post(&format!("https://api.anthropic.com{path}"))
+                    .set("Authorization", &format!("Bearer {}", tok.access))
+                    .set("anthropic-beta", "oauth-2025-04-20")
+                    .set("anthropic-version", "2023-06-01")
+                    .set("content-type", "application/json")
+                    .timeout(std::time::Duration::from_secs(20))
+                    .send_string(body);
+                let resp = match r {
+                    Ok(r) => r,
+                    Err(ureq::Error::Status(_, r)) => r,
+                    Err(e) => {
+                        println!("{} {path}: {e}", tok.source);
+                        continue;
+                    }
+                };
+                println!("{} {path}: {}", tok.source, resp.status());
+                for h in resp.headers_names() {
+                    if h.contains("ratelimit") || h == "retry-after" {
+                        println!("   {h}: {}", resp.header(&h).unwrap_or(""));
+                    }
+                }
+                println!(
+                    "   body {}",
+                    resp.into_string()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                );
             }
         }
     }

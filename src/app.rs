@@ -1022,14 +1022,21 @@ fn short_title(title: &str) -> String {
     if let Some(n) = low.strip_suffix("-day limit") {
         return format!("{n}d");
     }
-    let word = head.split_whitespace().next().unwrap_or(head);
+    // The first word tells the rows apart — unless it is an abbreviation
+    // ("G. Argon"), which is nothing without the word after it.
+    let mut words = head.split_whitespace();
+    let first = words.next().unwrap_or(head);
+    let word = match words.next() {
+        Some(second) if first.ends_with('.') => format!("{first} {second}"),
+        _ => first.to_string(),
+    };
     if is_window_tag(tail) {
         return format!("{word} {tail}");
     }
     match low.as_str() {
         "weekly" => "7d".to_string(),
         "monthly limit" => "30d".to_string(),
-        _ => word.to_string(),
+        _ => word,
     }
 }
 
@@ -1327,6 +1334,25 @@ impl eframe::App for App {
                 force_topmost(h);
             }
             self.last_topmost = anim_t;
+            // Windows pushes windows that overlap the taskbar back into the
+            // work area on its own (display/work-area changes, explorer
+            // restarts). The user's drag is the only placement we accept:
+            // put the strip back at the saved anchored edge.
+            if !self.dragging && self.applied_size != Vec2::ZERO {
+                if let (Some(r), Some((x, y))) =
+                    (ctx.input(|i| i.viewport().outer_rect), self.settings.pos)
+                {
+                    let target_y = match (self.settings.anchor, self.settings.pos_bottom) {
+                        (Anchor::Bottom, Some(b)) => b - self.applied_size.y,
+                        _ => y,
+                    };
+                    if (r.min.x - x).abs() > 1.0 || (r.min.y - target_y).abs() > 1.0 {
+                        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(
+                            x, target_y,
+                        )));
+                    }
+                }
+            }
         }
 
         egui::CentralPanel::default()
@@ -1466,5 +1492,6 @@ mod tests {
         assert_eq!(short_title("Gemini · 7d"), "Gemini 7d");
         assert_eq!(short_title("Claude / GPT · 5h"), "Claude 5h");
         assert_eq!(short_title("Claude / GPT · 7d"), "Claude 7d");
+        assert_eq!(short_title("G. Argon · 7d"), "G. Argon 7d");
     }
 }
